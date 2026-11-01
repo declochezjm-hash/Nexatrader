@@ -1,4 +1,5 @@
 import { geminiApiModelsToTry } from '../src/lib/geminiModels.js';
+import { formatGeminiUserMessage, isGeminiQuotaError } from '../src/lib/geminiErrors.js';
 
 export function resolveGeminiApiKey(apiKey) {
   const k = (apiKey ?? '').trim();
@@ -116,6 +117,9 @@ export async function callGeminiGenerateContent({
       return result.text;
     } catch (error) {
       lastError = error;
+      if (error?.status && isGeminiQuotaError(error.status, error.body ?? error.message)) {
+        throw new Error(formatGeminiUserMessage(error));
+      }
       if (error?.status && isModelNotFoundError(error.status, error.body ?? error.message)) {
         continue;
       }
@@ -139,6 +143,9 @@ export async function callGeminiGenerateContent({
         return result.text;
       } catch (error) {
         lastError = error;
+        if (error?.status && isGeminiQuotaError(error.status, error.body ?? error.message)) {
+          throw new Error(formatGeminiUserMessage(error));
+        }
         if (error?.status && isModelNotFoundError(error.status, error.body ?? error.message)) {
           continue;
         }

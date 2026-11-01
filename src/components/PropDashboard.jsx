@@ -1,8 +1,11 @@
-import { ShieldAlert } from 'lucide-react';
-import { useTrading } from '../context/TradingContext.jsx';
-import { geminiProviderLabel } from '../lib/geminiModels.js';
+import { memo, useState } from 'react';
+import { BookOpen, ShieldAlert, Sparkles } from 'lucide-react';
+import { useTradingSession } from '../context/TradingContext.jsx';
+import DisciplineScoreCard from './DisciplineScoreCard.jsx';
 import TradingPanel from './TradingPanel.jsx';
 import TipsBanner from './TipsBanner.jsx';
+import StableAiInsight from './StableAiInsight.jsx';
+import TradingStatusBanner from './TradingStatusBanner.jsx';
 
 function GaugeBar({ label, value, max, tone = 'emerald' }) {
   const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0;
@@ -26,53 +29,7 @@ function GaugeBar({ label, value, max, tone = 'emerald' }) {
   );
 }
 
-function scoreTone(confidence) {
-  if (confidence >= 75) return { bar: 'bg-emerald-400', text: 'text-emerald-300', ring: 'ring-emerald-500/30' };
-  if (confidence >= 50) return { bar: 'bg-amber-400', text: 'text-amber-300', ring: 'ring-amber-500/30' };
-  return { bar: 'bg-rose-500', text: 'text-rose-300', ring: 'ring-rose-500/30' };
-}
-
-function AiInsightCard({ insight, aiProvider }) {
-  const confidence = insight.confidence ?? 0;
-  const tone = scoreTone(confidence);
-  const signalStyles = {
-    BUY: 'bg-emerald-500/20 text-emerald-300',
-    SELL: 'bg-rose-500/20 text-rose-300',
-    SKIP: 'bg-slate-700/80 text-slate-300',
-  };
-
-  return (
-    <div className={`rounded-xl border border-slate-800 bg-slate-950/60 p-3 ring-1 ${tone.ring}`}>
-      <div className="mb-2 flex items-center justify-between">
-        <div>
-          <p className="text-[10px] uppercase tracking-wider text-slate-500">
-            {geminiProviderLabel(aiProvider)}
-            {insight.source === 'sqlite' && (
-              <span className="ml-1 text-slate-600">· fallback SQLite</span>
-            )}
-          </p>
-          <p className={`text-2xl font-semibold tabular-nums ${tone.text}`}>{confidence} %</p>
-        </div>
-        <span
-          className={`rounded-full px-3 py-1 text-xs font-semibold ${signalStyles[insight.signal] ?? signalStyles.SKIP}`}
-        >
-          {insight.signal}
-        </span>
-      </div>
-      <div className="mb-2 h-2 overflow-hidden rounded-full bg-slate-800">
-        <div
-          className={`h-full rounded-full transition-all duration-500 ${tone.bar}`}
-          style={{ width: `${Math.min(100, confidence)}%` }}
-        />
-      </div>
-      <p className="text-[11px] leading-relaxed text-slate-400">
-        {insight.advice ?? 'Analyse en cours…'}
-      </p>
-    </div>
-  );
-}
-
-export default function PropDashboard() {
+export default memo(function PropDashboard() {
   const {
     propGuard,
     aiInsight,
@@ -81,22 +38,41 @@ export default function PropDashboard() {
     killSwitchActive,
     challenge,
     settings,
-  } = useTrading();
+    requestDailySummary,
+    coachBusy,
+    disciplineScore,
+  } = useTradingSession();
 
+  const [readingMode, setReadingMode] = useState(true);
   const tradingPaused = killSwitchActive || challenge?.status === 'paused';
 
   return (
-    <aside className="flex w-[320px] shrink-0 flex-col border-l border-slate-800 bg-slate-950/80">
-      <div className="border-b border-slate-800 px-4 py-3">
-        <h2 className="text-sm font-semibold text-slate-100">PropGuard Ultra</h2>
-        <p className="text-[11px] text-slate-500">
-          WGF · IA contextuelle ·{' '}
-          {Number(settings?.auto_pilot) === 1 ? (
-            <span className="text-sky-400">Auto-Pilot ON (≥80%)</span>
-          ) : (
-            <span className="text-slate-600">Ctrl+Shift+K Kill</span>
-          )}
-        </p>
+    <aside className="flex h-full min-h-0 w-full flex-col bg-slate-950/80">
+      <div className="flex items-start justify-between gap-2 border-b border-slate-800 px-4 py-3">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-100">PropGuard Ultra</h2>
+          <p className="text-[11px] text-slate-500">
+            WGF · IA contextuelle ·{' '}
+            {Number(settings?.auto_pilot) === 1 ? (
+              <span className="text-sky-400">Auto-Pilot ON</span>
+            ) : (
+              <span className="text-slate-600">Ctrl+Shift+K Kill</span>
+            )}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setReadingMode((v) => !v)}
+          className={`inline-flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 text-[10px] ${
+            readingMode
+              ? 'border-sky-500/50 bg-sky-500/15 text-sky-200'
+              : 'border-slate-700 text-slate-400 hover:text-slate-200'
+          }`}
+          title="Figé : score IA et lot ralentis. Désactivez pour suivre le marché tick par tick."
+        >
+          <BookOpen className="h-3.5 w-3.5" />
+          Lecture
+        </button>
       </div>
 
       <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-4">
@@ -105,6 +81,14 @@ export default function PropDashboard() {
             Challenge FAILED — {challenge.failure_reason}
           </div>
         )}
+
+        <TradingStatusBanner
+          killSwitchActive={killSwitchActive}
+          tradingPaused={tradingPaused}
+          blocked={propGuard.blocked && !killSwitchActive}
+          reasons={propGuard.reasons}
+          onResume={() => resumeKillSwitch()}
+        />
 
         <GaugeBar
           label="Drawdown journalier"
@@ -119,35 +103,45 @@ export default function PropDashboard() {
           tone="rose"
         />
 
-        <AiInsightCard insight={aiInsight} aiProvider={settings?.ai_provider} />
+        <DisciplineScoreCard discipline={disciplineScore} />
+
+        <StableAiInsight
+          insight={aiInsight}
+          aiProvider={settings?.ai_provider}
+          frozen={readingMode}
+        />
+
+        <button
+          type="button"
+          disabled={coachBusy}
+          onClick={() => void requestDailySummary()}
+          className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-500/35 bg-violet-500/10 py-2 text-xs font-medium text-violet-200 hover:border-violet-400/50 disabled:opacity-40"
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+          Résumé journalier IA
+        </button>
 
         <TipsBanner />
 
-        <TradingPanel />
+        <TradingPanel readingMode={readingMode} />
 
-        {propGuard.blocked && (
+        {propGuard.blocked && !killSwitchActive && (
           <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
             <div className="mb-1 flex items-center gap-1.5 font-medium">
               <ShieldAlert className="h-3.5 w-3.5" />
-              Exécution bloquée
+              Détails PropGuard
             </div>
             <ul className="list-inside list-disc space-y-0.5 text-amber-100/90">
-              {propGuard.reasons.map((r) => (
-                <li key={r}>{r}</li>
-              ))}
+              {propGuard.reasons
+                .filter((r) => !/kill switch/i.test(r))
+                .map((r) => (
+                  <li key={r}>{r}</li>
+                ))}
             </ul>
           </div>
         )}
 
-        {tradingPaused ? (
-          <button
-            type="button"
-            onClick={() => resumeKillSwitch()}
-            className="mt-auto flex items-center justify-center gap-2 rounded-xl border-2 border-emerald-600 bg-emerald-950/50 py-3 text-sm font-bold text-emerald-100 transition hover:bg-emerald-900/80"
-          >
-            Reprendre le trading
-          </button>
-        ) : (
+        {!tradingPaused && (
           <button
             type="button"
             onClick={() => executeKillSwitch()}
@@ -156,12 +150,7 @@ export default function PropDashboard() {
             🚨 KILL SWITCH
           </button>
         )}
-        {tradingPaused && (
-          <p className="text-center text-[11px] text-amber-300">
-            Pause sécurisée — cliquez « Reprendre le trading » pour réactiver ACHAT / VENTE.
-          </p>
-        )}
       </div>
     </aside>
   );
-}
+});

@@ -9,6 +9,7 @@ import {
   isDatabaseReady,
   ensureDatabaseSchema,
   getDatabaseStatus,
+  atomicCloseTradeWithPattern,
 } from './database.js';
 import { callGeminiGenerateContent, hasGeminiApiKeyInEnv } from './geminiBridge.js';
 import { loginWithGoogle, refreshGoogleAccessTokenIfNeeded, isGoogleOAuthConfigured } from './googleAuth.js';
@@ -108,6 +109,11 @@ function registerDatabaseIpc() {
         lastInsertRowid: Number(result.lastInsertRowid),
       };
     }),
+  );
+
+  ipcMain.handle(
+    'db:atomicCloseTrade',
+    wrapDbHandler(async (_event, payload) => atomicCloseTradeWithPattern(payload ?? {})),
   );
 }
 

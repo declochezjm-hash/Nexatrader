@@ -3,6 +3,14 @@ import { estimatePnl } from './positionSizer.js';
 
 const BE_RR = 1.5;
 
+/** Part maximale de l’amplitude de bougie utilisée comme glissement admissible. */
+const SLIPPAGE_RANGE_FRACTION = 0.35;
+const SLIPPAGE_FLOOR = {
+  XAUUSD: 0.12,
+  NAS100: 0.9,
+  DEFAULT: 0.05,
+};
+
 function initialRisk(trade) {
   if (trade.entry_price == null || trade.stop_loss == null) return 0;
   return Math.abs(trade.entry_price - trade.stop_loss);
@@ -11,6 +19,12 @@ function initialRisk(trade) {
 function isBreakEvenSl(trade) {
   if (trade.entry_price == null || trade.stop_loss == null) return false;
   return Math.abs(trade.entry_price - trade.stop_loss) < 0.0001;
+}
+
+function slippageAllowance(symbol, candle) {
+  const range = Math.max(0, (candle.high ?? 0) - (candle.low ?? 0));
+  const floor = SLIPPAGE_FLOOR[symbol] ?? SLIPPAGE_FLOOR.DEFAULT;
+  return Math.max(floor, range * SLIPPAGE_RANGE_FRACTION);
 }
 
 function slHit(trade, candle) {
@@ -25,6 +39,44 @@ function tpHit(trade, candle) {
   if (tp == null) return false;
   if (trade.type === 'BUY') return candle.high >= tp;
   return candle.low <= tp;
+}
+
+/**
+ * Prix de sortie SL avec glissement plafonné sur bougies volatiles.
+ */
+export function resolveStopLossExitPrice(trade, candle) {
+  const sl = trade.stop_loss;
+  if (sl == null) return sl;
+  const allowance = slippageAllowance(trade.symbol, candle);
+
+  if (trade.type === 'BUY') {
+    if (candle.low > sl) return Number(sl.toFixed(2));
+    const worst = Math.max(candle.low, sl - allowance);
+    return Number(worst.toFixed(2));
+  }
+
+  if (candle.high < sl) return Number(sl.toFixed(2));
+  const worst = Math.min(candle.high, sl + allowance);
+  return Number(worst.toFixed(2));
+}
+
+/**
+ * Prix de sortie TP avec glissement défavorable plafonné.
+ */
+export function resolveTakeProfitExitPrice(trade, candle) {
+  const tp = trade.take_profit;
+  if (tp == null) return tp;
+  const allowance = slippageAllowance(trade.symbol, candle);
+
+  if (trade.type === 'BUY') {
+    if (candle.high < tp) return Number(tp.toFixed(2));
+    const fill = Math.max(tp, candle.high - allowance);
+    return Number(Math.min(candle.high, fill).toFixed(2));
+  }
+
+  if (candle.low > tp) return Number(tp.toFixed(2));
+  const fill = Math.min(tp, candle.low + allowance);
+  return Number(Math.max(candle.low, fill).toFixed(2));
 }
 
 function unrealizedAtExtreme(trade, candle) {
@@ -78,7 +130,7 @@ export async function processMarketTick({
     }
 
     if (slHit(trade, candle)) {
-      const exit = trade.stop_loss;
+      const exit = resolveStopLossExitPrice(trade, candle);
       const result = await closeOpenTrade({
         trade,
         exitPrice: exit,
@@ -93,13 +145,14 @@ export async function processMarketTick({
           tradeId: trade.id,
           pnl: result.pnl,
           outcome: result.outcome,
+          exitPrice: exit,
         });
       }
       continue;
     }
 
     if (tpHit(trade, candle)) {
-      const exit = trade.take_profit;
+      const exit = resolveTakeProfitExitPrice(trade, candle);
       const result = await closeOpenTrade({
         trade,
         exitPrice: exit,
@@ -114,6 +167,7 @@ export async function processMarketTick({
           tradeId: trade.id,
           pnl: result.pnl,
           outcome: result.outcome,
+          exitPrice: exit,
         });
       }
     }

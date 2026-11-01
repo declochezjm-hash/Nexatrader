@@ -5,6 +5,7 @@ const ALLOWED_INVOKE_CHANNELS = new Set([
   'db:run',
   'db:get',
   'db:status',
+  'db:atomicCloseTrade',
   'app:getVersion',
   'app:getPlatform',
   'app:openExternal',
@@ -88,6 +89,7 @@ contextBridge.exposeInMainWorld('nexaTrader', {
     query: dbQuery,
     run: dbRun,
     get: dbGet,
+    atomicCloseTrade: (payload) => invokeSafe('db:atomicCloseTrade', payload),
   },
 
   auth: {

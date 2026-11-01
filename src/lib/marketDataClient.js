@@ -2,6 +2,8 @@
  * Client renderer — bougies live via IPC Electron (évite CORS).
  */
 
+import { isDemoMarketProvider, normalizeMarketProvider } from './marketFeedMode.js';
+
 export async function fetchLiveCandlesFromMain({ provider, apiKey, symbol, timeframe }) {
   if (typeof window === 'undefined' || !window.nexaTrader?.market?.fetchCandles) {
     throw new Error('Données live disponibles uniquement dans la fenêtre desktop Electron.');
@@ -37,12 +39,19 @@ export function resolveMarketFeedLabel(settings, importedSeries) {
       title: `Graphique importé (${importedSeries.candles.length} bougies)`,
     };
   }
-  const provider = settings?.market_provider ?? 'simulated';
+  const provider = normalizeMarketProvider(settings?.market_provider);
+  if (isDemoMarketProvider(provider)) {
+    return {
+      tone: 'sky',
+      short: 'Twelve Data démo',
+      title: 'Flux Twelve Data simulé (order flow, spread, sans clé API)',
+    };
+  }
   if (provider === 'twelve_data') {
     return {
       tone: 'emerald',
-      short: 'Live Twelve Data',
-      title: 'Cotations via API Twelve Data (gratuit avec clé)',
+      short: 'Twelve Data live',
+      title: 'Cotations réelles via clé API Twelve Data',
     };
   }
   if (provider === 'finnhub') {
@@ -54,7 +63,7 @@ export function resolveMarketFeedLabel(settings, importedSeries) {
   }
   return {
     tone: 'amber',
-    short: 'Simulation locale',
-    title: 'Bougies générées localement — pas de broker',
+    short: 'Marché',
+    title: 'Source de données marché',
   };
 }

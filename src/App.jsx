@@ -4,9 +4,12 @@ import PropDashboard from './components/PropDashboard.jsx';
 import DrawingToolbar from './components/DrawingToolbar.jsx';
 import ChartContainer from './components/ChartContainer.jsx';
 import TradeJournal from './components/TradeJournal.jsx';
+import ResizableWorkspace from './components/ResizableWorkspace.jsx';
 import Analytics from './components/Analytics.jsx';
 import SettingsModal from './components/SettingsModal.jsx';
 import TutorialPanel from './components/TutorialPanel.jsx';
+import PreTradeChecklistModal from './components/PreTradeChecklistModal.jsx';
+import ProactiveAlerts from './components/ProactiveAlerts.jsx';
 import { TradingProvider, useTrading } from './context/TradingContext.jsx';
 
 function MainShell() {
@@ -28,17 +31,23 @@ function MainShell() {
         <Toolbar />
         <div className="flex min-h-0 flex-1">
           <DrawingToolbar />
-          <ChartContainer />
-          <PropDashboard />
+          <ResizableWorkspace
+            chart={<ChartContainer />}
+            sidebar={<PropDashboard />}
+            bottom={
+              analyticsOpen ? (
+                <Analytics onClose={() => setAnalyticsOpen(false)} />
+              ) : (
+                <TradeJournal />
+              )
+            }
+          />
         </div>
-        {analyticsOpen ? (
-          <Analytics onClose={() => setAnalyticsOpen(false)} />
-        ) : (
-          <TradeJournal />
-        )}
       </div>
       <SettingsModal />
       <TutorialPanel />
+      <ProactiveAlerts />
+      <PreTradeChecklistModal />
     </>
   );
 }

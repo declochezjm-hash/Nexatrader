@@ -2,6 +2,13 @@ import Database from 'better-sqlite3';
 import path from 'node:path';
 import { app } from 'electron';
 import fs from 'node:fs';
+import {
+  ANTI_TILT_LOSS_THRESHOLD,
+  computeEquityFromTrades,
+  nextAntiTiltUntil,
+  shouldFailChallenge,
+} from '../src/engine/propGuard.js';
+import { normalizePatternType } from '../src/lib/patternMemory.js';
 
 const DB_FILENAME = 'trading_local.db';
 
@@ -72,6 +79,22 @@ const SCHEMA_STATEMENTS = [
   )`,
   `INSERT OR IGNORE INTO app_settings (id, is_quick_setup, first_launch_completed)
    VALUES (1, 0, 0)`,
+  `CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_pattern_lookup ON ai_pattern_memory(symbol, pattern_type, trade_hour)`,
+  `CREATE TABLE IF NOT EXISTS coach_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS journal_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id INTEGER,
+    note_text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'text',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
 ];
 
 export function isDatabaseReady() {
@@ -102,6 +125,7 @@ export function initDatabase() {
     db = new Database(dbPath);
 
     db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
     db.pragma('foreign_keys = ON');
 
     const migrate = db.transaction(() => {
@@ -157,6 +181,139 @@ function runOptionalMigrations(database) {
 export function ensureDatabaseSchema() {
   if (!db) return;
   runOptionalMigrations(db);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)`);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_pattern_lookup ON ai_pattern_memory(symbol, pattern_type, trade_hour)`,
+  );
+}
+
+/**
+ * Exécute un bloc synchrone dans une transaction SQLite (better-sqlite3).
+ * @template T
+ * @param {(database: import('better-sqlite3').Database) => T} fn
+ * @returns {T}
+ */
+export function runInTransaction(fn) {
+  const database = getDatabase();
+  const wrapped = database.transaction(fn);
+  return wrapped();
+}
+
+/**
+ * Clôture trade + WGF + mémoire pattern en une seule transaction.
+ * @param {{
+ *   tradeId: number,
+ *   exitPrice: number,
+ *   pnl: number,
+ *   challenge?: object | null,
+ *   patternSnapshot?: object | null,
+ * }} payload
+ */
+export function atomicCloseTradeWithPattern(payload) {
+  const { tradeId, exitPrice, pnl, challenge, patternSnapshot } = payload;
+  const database = getDatabase();
+
+  const closeTrade = database.prepare(
+    `UPDATE trades SET exit_price = ?, pnl = ?, status = 'closed' WHERE id = ?`,
+  );
+  const updateChallengeStreak = database.prepare(
+    `UPDATE local_challenge SET consecutive_losses = ?, anti_tilt_until = ? WHERE id = ?`,
+  );
+  const updateChallengeEquity = database.prepare(
+    `UPDATE local_challenge SET current_equity = ? WHERE id = ?`,
+  );
+  const failChallenge = database.prepare(
+    `UPDATE local_challenge SET current_equity = ?, status = 'failed', failure_reason = ? WHERE id = ?`,
+  );
+  const insertPattern = database.prepare(
+    `INSERT INTO ai_pattern_memory (
+      symbol, pattern_type, upper_wick_ratio, lower_wick_ratio,
+      is_liquidity_sweep, trade_hour, trade_day_of_week, market_trend,
+      outcome, ai_confidence_score
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const listTradesForEquity = database.prepare(
+    `SELECT id, pnl, status, type, symbol, lot_size, entry_price FROM trades`,
+  );
+
+  const outcome = pnl >= 0 ? 'WIN' : 'LOSS';
+
+  return runInTransaction(() => {
+    closeTrade.run(exitPrice, pnl, tradeId);
+
+    let nextChallenge = challenge ?? null;
+
+    if (challenge?.id) {
+      const isLoss = pnl < 0;
+      let consecutive = challenge.consecutive_losses ?? 0;
+      let antiTiltUntil = challenge.anti_tilt_until ?? null;
+
+      if (isLoss) {
+        consecutive += 1;
+        if (consecutive >= ANTI_TILT_LOSS_THRESHOLD) {
+          antiTiltUntil = nextAntiTiltUntil();
+        }
+      } else if (pnl > 0) {
+        consecutive = 0;
+        antiTiltUntil = null;
+      }
+
+      updateChallengeStreak.run(consecutive, antiTiltUntil, challenge.id);
+
+      const trades = listTradesForEquity.all();
+      const equity = computeEquityFromTrades(challenge, trades);
+      const failCheck = shouldFailChallenge(challenge, equity);
+
+      if (failCheck.fail) {
+        failChallenge.run(equity, failCheck.reason, challenge.id);
+        nextChallenge = {
+          ...challenge,
+          current_equity: equity,
+          status: 'failed',
+          failure_reason: failCheck.reason,
+          consecutive_losses: consecutive,
+          anti_tilt_until: antiTiltUntil,
+        };
+      } else {
+        updateChallengeEquity.run(equity, challenge.id);
+        nextChallenge = {
+          ...challenge,
+          current_equity: equity,
+          consecutive_losses: consecutive,
+          anti_tilt_until: antiTiltUntil,
+        };
+      }
+    }
+
+    let patternId = null;
+    if (patternSnapshot) {
+      const patternType = normalizePatternType(
+        patternSnapshot.pattern_type ?? patternSnapshot.pattern,
+      );
+      const insertResult = insertPattern.run(
+        patternSnapshot.symbol,
+        patternType,
+        patternSnapshot.upper_wick_ratio ?? 0,
+        patternSnapshot.lower_wick_ratio ?? 0,
+        patternSnapshot.is_liquidity_sweep ? 1 : 0,
+        patternSnapshot.trade_hour ?? new Date().getUTCHours(),
+        patternSnapshot.trade_day_of_week ?? new Date().getUTCDay(),
+        patternSnapshot.market_trend ?? null,
+        outcome,
+        patternSnapshot.ai_confidence_score ?? null,
+      );
+      patternId = Number(insertResult.lastInsertRowid);
+    }
+
+    return {
+      ok: true,
+      tradeId,
+      pnl,
+      outcome,
+      challenge: nextChallenge,
+      patternId,
+    };
+  });
 }
 
 export function getDatabase() {

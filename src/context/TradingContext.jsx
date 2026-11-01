@@ -13,8 +13,24 @@ import { executeOpenOrder, refreshEquityState } from '../lib/orderExecution.js';
 import { processMarketTick as runTradeMonitor } from '../engine/tradeMonitor.js';
 import { processWickSignal, isActionableWickSignal } from '../lib/aiPipeline.js';
 import { TUTORIAL_STORAGE_KEY } from '../lib/tutorialContent.js';
+import { askCoach, coachWelcomeMessage } from '../lib/aiCoach.js';
+import { clearCoachHistoryDb, loadCoachHistory, replaceCoachHistory } from '../lib/coachHistory.js';
+import { parseCoachSlashCommand } from '../lib/coachSlash.js';
+import { generateDailySummary } from '../lib/dailySummary.js';
 import { normalizeGeminiSettingsId } from '../lib/geminiModels.js';
 import { assertDbWriteOk } from '../lib/settingsPersist.js';
+import { computeWgfDisciplineScore } from '../lib/disciplineScore.js';
+import { shouldSkipPreTradeChecklist, setSkipPreTradeChecklist } from '../lib/preTradeChecklist.js';
+import { fetchTradeDetail } from '../lib/tradeJournalAdmin.js';
+import { compareTradeDecision } from '../lib/tradeDecisionCompare.js';
+
+function patternDirectionFromSnapshot(snap) {
+  if (!snap) return null;
+  const p = snap.pattern_type ?? snap.pattern;
+  if (p === 'hammer') return 'BUY';
+  if (p === 'shooting_star') return 'SELL';
+  return snap.suggestedDirection ?? null;
+}
 
 const IMPORT_STORAGE_KEY = 'nexatrader_imported_candles_v1';
 const IMPORT_MAX_CANDLES = 1500;
@@ -33,6 +49,8 @@ const AI_DEFAULTS = {
 };
 
 const TradingContext = createContext(null);
+const TradingMarketContext = createContext(null);
+const TradingSessionContext = createContext(null);
 
 export function TradingProvider({ children }) {
   const [booting, setBooting] = useState(true);
@@ -61,7 +79,28 @@ export function TradingProvider({ children }) {
   const [drawings, setDrawings] = useState([]);
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
+  const [coachOpen, setCoachOpen] = useState(false);
+  const [coachMessages, setCoachMessages] = useState(() => [
+    {
+      id: 'welcome',
+      role: 'assistant',
+      text: coachWelcomeMessage(),
+      source: 'local',
+    },
+  ]);
+  const [coachBusy, setCoachBusy] = useState(false);
+  const [pendingPreTradeSide, setPendingPreTradeSide] = useState(null);
+  const [preTradeSnapshot, setPreTradeSnapshot] = useState(null);
+  const [replayActive, setReplayActive] = useState(false);
+  const [replayFrame, setReplayFrame] = useState(0);
+  const [replayCandleCount, setReplayCandleCount] = useState(0);
+  const replayCandlesRef = useRef([]);
+  const coachSeqRef = useRef(0);
+  const coachMessagesRef = useRef(coachMessages);
+  coachMessagesRef.current = coachMessages;
+  const chartControlsRef = useRef(null);
   const [importedSeries, setImportedSeriesState] = useState(null);
+  const [activeTradeReview, setActiveTradeReview] = useState(null);
 
   const workerRef = useRef(null);
   const analyzePendingRef = useRef(new Map());
@@ -141,6 +180,15 @@ export function TradingProvider({ children }) {
     setShowOnboarding(Number(appSettings.first_launch_completed) !== 1);
     await refreshChallenge();
     await refreshTrades();
+    try {
+      const savedCoach = await loadCoachHistory();
+      if (savedCoach.length) {
+        coachMessagesRef.current = savedCoach;
+        setCoachMessages(savedCoach);
+      }
+    } catch {
+      /* ignore */
+    }
   }, [refreshChallenge, refreshTrades]);
 
   useEffect(() => {
@@ -329,6 +377,230 @@ export function TradingProvider({ children }) {
     [symbol, currentSpread, challenge, inSession, killSwitchActive, settings?.paper_trading],
   );
 
+  const registerChartControls = useCallback((api) => {
+    chartControlsRef.current = api;
+  }, []);
+
+  const clearTradeChartReview = useCallback(() => {
+    setActiveTradeReview(null);
+    chartControlsRef.current?.clearTradeReviewOverlay?.();
+  }, []);
+
+  const focusTradeOnChart = useCallback(
+    async (tradeIdOrRow) => {
+      const trade =
+        typeof tradeIdOrRow === 'object' && tradeIdOrRow != null
+          ? tradeIdOrRow
+          : await fetchTradeDetail(tradeIdOrRow);
+      if (!trade) return;
+      const snap = patternByTradeRef.current.get(trade.id);
+      const comparison = compareTradeDecision(trade, {
+        aiSignal: aiInsight?.signal,
+        aiConfidence: aiInsight?.confidence,
+        patternDirection: patternDirectionFromSnapshot(snap),
+      });
+      const seq = Date.now();
+      setActiveTradeReview({ trade, comparison, seq });
+      if (trade.symbol !== symbol) {
+        setSymbol(trade.symbol);
+      } else {
+        queueMicrotask(() => {
+          chartControlsRef.current?.applyTradeFocusOnChart?.(trade);
+        });
+      }
+    },
+    [aiInsight?.confidence, aiInsight?.signal, symbol],
+  );
+
+  const updateSettingsRef = useRef(null);
+
+  const executeCoachAction = useCallback(
+    async (action) => {
+      if (!action?.type) return;
+      const controls = chartControlsRef.current;
+      switch (action.type) {
+        case 'ZOOM_IN':
+          controls?.zoomIn?.();
+          break;
+        case 'ZOOM_OUT':
+          controls?.zoomOut?.();
+          break;
+        case 'PAUSE_FEED':
+          controls?.pauseFeed?.();
+          break;
+        case 'RESUME_FEED':
+          controls?.resumeFeed?.();
+          break;
+        case 'OPEN_SETTINGS':
+          setSettingsOpen(true);
+          break;
+        case 'OPEN_TUTORIAL':
+          setTutorialOpen(true);
+          break;
+        case 'SET_RISK':
+          await updateSettingsRef.current?.({ riskPercent: action.riskPercent });
+          break;
+        case 'DAILY_SUMMARY':
+          await requestDailySummaryRef.current?.();
+          break;
+        default:
+          break;
+      }
+    },
+    [],
+  );
+
+  const requestDailySummaryRef = useRef(null);
+
+  const requestDailySummary = useCallback(async () => {
+    setCoachBusy(true);
+    setCoachOpen(true);
+    try {
+      const summary = await generateDailySummary({
+        trades,
+        challenge,
+        settings: settings ?? {},
+      });
+      const entry = {
+        id: `summary-${Date.now()}`,
+        role: 'assistant',
+        text: summary.text,
+        source: summary.source ?? 'local',
+      };
+      setCoachMessages((prev) => {
+        const next = [...prev, entry];
+        coachMessagesRef.current = next;
+        void replaceCoachHistory(next);
+        return next;
+      });
+    } finally {
+      setCoachBusy(false);
+    }
+  }, [challenge, settings, trades]);
+
+  requestDailySummaryRef.current = requestDailySummary;
+
+  const persistCoachMessages = useCallback((messages) => {
+    void replaceCoachHistory(messages);
+  }, []);
+
+  const sendCoachMessage = useCallback(
+    async (text) => {
+      const trimmed = text?.trim();
+      if (!trimmed) return;
+
+      const slash = parseCoachSlashCommand(trimmed);
+      if (slash.handled) {
+        const userEntry = {
+          id: `u-${Date.now()}-${coachSeqRef.current++}`,
+          role: 'user',
+          text: trimmed,
+        };
+        const historyWithUser = [...coachMessagesRef.current, userEntry];
+        coachMessagesRef.current = historyWithUser;
+        setCoachMessages(historyWithUser);
+
+        if (slash.action) {
+          await executeCoachAction(slash.action);
+        }
+
+        const assistantEntry = {
+          id: `a-${Date.now()}-${coachSeqRef.current++}`,
+          role: 'assistant',
+          text: slash.reply ?? 'Commande exécutée.',
+          source: 'local',
+        };
+        const next = [...historyWithUser, assistantEntry];
+        coachMessagesRef.current = next;
+        setCoachMessages(next);
+        persistCoachMessages(next);
+        return;
+      }
+
+      const userEntry = {
+        id: `u-${Date.now()}-${coachSeqRef.current++}`,
+        role: 'user',
+        text: trimmed,
+      };
+      const historyWithUser = [...coachMessagesRef.current, userEntry];
+      coachMessagesRef.current = historyWithUser;
+      setCoachMessages(historyWithUser);
+      setCoachBusy(true);
+
+      const sessionContext = {
+        symbol,
+        timeframe,
+        marketPrice,
+        currentSpread,
+        challengeStatus: challenge?.status ?? 'inactive',
+        equity: challenge?.current_equity,
+        aiSignal: aiInsight?.signal,
+        aiConfidence: aiInsight?.confidence,
+        aiAdvice: aiInsight?.advice,
+        killSwitchActive,
+        inSession,
+        propBlocked: !propGuard.allowed,
+        propReasons: propGuard.reasons ?? [],
+        latestPattern: latestChartSignal?.pattern ?? null,
+      };
+
+      try {
+        const reply = await askCoach(
+          trimmed,
+          historyWithUser,
+          sessionContext,
+          settings ?? {},
+        );
+        setCoachMessages((prev) => {
+          const next = [
+            ...prev,
+            {
+              id: `a-${Date.now()}-${coachSeqRef.current++}`,
+              role: 'assistant',
+              text: reply.text,
+              source: reply.source ?? 'local',
+            },
+          ];
+          coachMessagesRef.current = next;
+          persistCoachMessages(next);
+          return next;
+        });
+      } finally {
+        setCoachBusy(false);
+      }
+    },
+    [
+      aiInsight,
+      challenge,
+      currentSpread,
+      executeCoachAction,
+      inSession,
+      killSwitchActive,
+      latestChartSignal?.pattern,
+      marketPrice,
+      persistCoachMessages,
+      propGuard.allowed,
+      propGuard.reasons,
+      settings,
+      symbol,
+      timeframe,
+    ],
+  );
+
+  const clearCoachChat = useCallback(() => {
+    const welcome = [
+      {
+        id: 'welcome',
+        role: 'assistant',
+        text: coachWelcomeMessage(),
+        source: 'local',
+      },
+    ];
+    coachMessagesRef.current = welcome;
+    setCoachMessages(welcome);
+    void clearCoachHistoryDb();
+  }, []);
+
   const completeOnboarding = useCallback(
     async (payload) => {
       const db = window.nexaTrader?.db;
@@ -448,6 +720,8 @@ export function TradingProvider({ children }) {
     [reloadApp, settings],
   );
 
+  updateSettingsRef.current = updateSettings;
+
   const updateChallengeSettings = useCallback(
     async (payload) => {
       await updateActiveChallengeLimits(payload);
@@ -466,14 +740,18 @@ export function TradingProvider({ children }) {
   );
 
   const placeOrder = useCallback(
-    async (side) => {
+    async (side, orderOverrides = {}) => {
       const result = await executeOpenOrder({
         symbol,
         side,
         challenge,
         settings,
-        marketPrice: marketPrice ?? latestChartSignal?.entry,
-        stopLossPrice: activeStopLoss ?? latestChartSignal?.stopLoss,
+        marketPrice:
+          orderOverrides.entry ?? marketPrice ?? latestChartSignal?.entry,
+        stopLossPrice:
+          orderOverrides.stopLoss ??
+          activeStopLoss ??
+          latestChartSignal?.stopLoss,
         takeProfitPrice: latestChartSignal?.breakEven,
         currentSpread,
         inSession,
@@ -505,6 +783,118 @@ export function TradingProvider({ children }) {
       settings,
       symbol,
     ],
+  );
+
+  const buildPreTradeSnapshot = useCallback(
+    (side) => ({
+      side,
+      symbol,
+      entry: marketPrice ?? latestChartSignal?.entry ?? null,
+      stopLoss: activeStopLoss ?? latestChartSignal?.stopLoss ?? null,
+      riskPercent: settings?.default_risk_percent ?? 1,
+      balance: challenge?.current_equity ?? challenge?.initial_balance ?? 0,
+      aiSignal: aiInsight?.signal ?? 'SKIP',
+      aiConfidence: aiInsight?.confidence ?? 0,
+      capturedAt: Date.now(),
+    }),
+    [
+      activeStopLoss,
+      aiInsight?.confidence,
+      aiInsight?.signal,
+      challenge,
+      latestChartSignal?.entry,
+      latestChartSignal?.stopLoss,
+      marketPrice,
+      settings?.default_risk_percent,
+      symbol,
+    ],
+  );
+
+  const requestPlaceOrder = useCallback(
+    (side) => {
+      if (shouldSkipPreTradeChecklist()) {
+        void placeOrder(side);
+        return;
+      }
+      setPreTradeSnapshot(buildPreTradeSnapshot(side));
+      setPendingPreTradeSide(side);
+    },
+    [buildPreTradeSnapshot, placeOrder],
+  );
+
+  const refreshPreTradeSnapshot = useCallback(() => {
+    setPreTradeSnapshot((prev) => (prev?.side ? buildPreTradeSnapshot(prev.side) : prev));
+  }, [buildPreTradeSnapshot]);
+
+  const patchPreTradeSnapshot = useCallback((patch) => {
+    setPreTradeSnapshot((prev) => {
+      if (!prev) return prev;
+      return { ...prev, ...patch, capturedAt: Date.now() };
+    });
+  }, []);
+
+  const cancelPreTradeOrder = useCallback(() => {
+    setPendingPreTradeSide(null);
+    setPreTradeSnapshot(null);
+  }, []);
+
+  const confirmPreTradeOrder = useCallback(async () => {
+    const side = pendingPreTradeSide;
+    const snap = preTradeSnapshot;
+    if (!side || !snap) return null;
+    const result = await placeOrder(side, {
+      entry: snap.entry,
+      stopLoss: snap.stopLoss,
+    });
+    if (result?.ok) {
+      setPendingPreTradeSide(null);
+      setPreTradeSnapshot(null);
+    }
+    return result;
+  }, [pendingPreTradeSide, placeOrder, preTradeSnapshot]);
+
+  const startSessionReplay = useCallback(() => {
+    const candles = chartControlsRef.current?.captureForReplay?.();
+    if (!candles?.length || candles.length < 10) return false;
+    replayCandlesRef.current = candles;
+    const start = Math.max(20, candles.length - 80);
+    setReplayCandleCount(candles.length);
+    setReplayFrame(start);
+    setReplayActive(true);
+    chartControlsRef.current?.applyReplayFrame?.(start, candles);
+    return true;
+  }, []);
+
+  const stopSessionReplay = useCallback(() => {
+    setReplayActive(false);
+    const candles = replayCandlesRef.current;
+    if (candles?.length) {
+      chartControlsRef.current?.applyReplayFrame?.(candles.length, candles);
+    }
+    replayCandlesRef.current = [];
+    setReplayCandleCount(0);
+    chartControlsRef.current?.resumeFeed?.();
+  }, []);
+
+  const stepSessionReplay = useCallback((delta) => {
+    const all = replayCandlesRef.current;
+    if (!all.length) return;
+    setReplayFrame((f) => {
+      const next = Math.max(1, Math.min(all.length, f + delta));
+      chartControlsRef.current?.applyReplayFrame?.(next, all);
+      return next;
+    });
+  }, []);
+
+  const disciplineScore = useMemo(
+    () =>
+      computeWgfDisciplineScore({
+        challenge,
+        trades,
+        killSwitchActive,
+        propBlocked: propGuard.blocked,
+      }),
+    [challenge, trades, killSwitchActive, propGuard.blocked],
   );
 
   const executeKillSwitch = useCallback(async () => {
@@ -602,17 +992,55 @@ export function TradingProvider({ children }) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [executeKillSwitch]);
 
-  const value = useMemo(
+  const marketValue = useMemo(
+    () => ({
+      symbol,
+      setSymbol,
+      timeframe,
+      setTimeframe,
+      marketPrice,
+      setMarketPrice,
+      currentSpread,
+      setCurrentSpread,
+      chartBridge,
+      setChartBridge,
+      chartReady,
+      setChartReady,
+      drawingTool,
+      setDrawingTool,
+      drawings,
+      setDrawings,
+      importedSeries,
+      setImportedSeries,
+      clearImportedSeries,
+      activeStopLoss,
+      setActiveStopLoss,
+      registerChartControls,
+    }),
+    [
+      symbol,
+      timeframe,
+      marketPrice,
+      currentSpread,
+      chartBridge,
+      chartReady,
+      drawingTool,
+      drawings,
+      importedSeries,
+      setImportedSeries,
+      clearImportedSeries,
+      activeStopLoss,
+      registerChartControls,
+    ],
+  );
+
+  const sessionValue = useMemo(
     () => ({
       booting,
       showOnboarding,
       settings,
       challenge,
       trades,
-      symbol,
-      setSymbol,
-      timeframe,
-      setTimeframe,
       settingsOpen,
       setSettingsOpen,
       dbStatus,
@@ -625,45 +1053,53 @@ export function TradingProvider({ children }) {
       updateChallengeSettings,
       resetChallenge,
       placeOrder,
+      requestPlaceOrder,
+      cancelPreTradeOrder,
+      confirmPreTradeOrder,
+      pendingPreTradeSide,
+      preTradeSnapshot,
+      refreshPreTradeSnapshot,
+      patchPreTradeSnapshot,
+      disciplineScore,
+      replayActive,
+      replayFrame,
+      replayTotal: replayCandleCount,
+      startSessionReplay,
+      stopSessionReplay,
+      stepSessionReplay,
       executeKillSwitch,
       resumeKillSwitch,
       killSwitchActive,
-      marketPrice,
-      setMarketPrice,
-      currentSpread,
-      setCurrentSpread,
-      activeStopLoss,
-      setActiveStopLoss,
       reloadApp,
-      chartBridge,
-      setChartBridge,
-      chartReady,
-      setChartReady,
       analyzeCandles,
       latestChartSignal,
       setLatestChartSignal,
       setInSession,
-      drawingTool,
-      setDrawingTool,
-      drawings,
-      setDrawings,
       analyticsOpen,
       setAnalyticsOpen,
       tutorialOpen,
       setTutorialOpen,
-      processMarketTick,
-      importedSeries,
-      setImportedSeries,
-      clearImportedSeries,
-    }),
+      coachOpen,
+      setCoachOpen,
+      coachMessages,
+      coachBusy,
+      sendCoachMessage,
+      clearCoachChat,
+    requestDailySummary,
+    processMarketTick,
+    proactiveAlertsEnabled: true,
+    refreshTrades,
+    refreshChallenge,
+    activeTradeReview,
+    focusTradeOnChart,
+    clearTradeChartReview,
+  }),
     [
       booting,
       showOnboarding,
       settings,
       challenge,
       trades,
-      symbol,
-      timeframe,
       settingsOpen,
       dbStatus,
       workerStatus,
@@ -674,29 +1110,71 @@ export function TradingProvider({ children }) {
       updateChallengeSettings,
       resetChallenge,
       placeOrder,
+      requestPlaceOrder,
+      cancelPreTradeOrder,
+      confirmPreTradeOrder,
+      pendingPreTradeSide,
+      preTradeSnapshot,
+      refreshPreTradeSnapshot,
+      patchPreTradeSnapshot,
+      disciplineScore,
+      replayActive,
+      replayFrame,
+      replayCandleCount,
+      startSessionReplay,
+      stopSessionReplay,
+      stepSessionReplay,
       executeKillSwitch,
       resumeKillSwitch,
       killSwitchActive,
-      marketPrice,
-      currentSpread,
-      activeStopLoss,
       reloadApp,
-      chartBridge,
-      chartReady,
       analyzeCandles,
       latestChartSignal,
-      drawingTool,
-      drawings,
       analyticsOpen,
       tutorialOpen,
+      coachOpen,
+      coachMessages,
+      coachBusy,
+      sendCoachMessage,
+      clearCoachChat,
+      requestDailySummary,
       processMarketTick,
-      importedSeries,
-      setImportedSeries,
-      clearImportedSeries,
+      refreshTrades,
+      refreshChallenge,
+      activeTradeReview,
+      focusTradeOnChart,
+      clearTradeChartReview,
     ],
   );
 
-  return <TradingContext.Provider value={value}>{children}</TradingContext.Provider>;
+  const legacyValue = useMemo(
+    () => ({ ...marketValue, ...sessionValue }),
+    [marketValue, sessionValue],
+  );
+
+  return (
+    <TradingSessionContext.Provider value={sessionValue}>
+      <TradingMarketContext.Provider value={marketValue}>
+        <TradingContext.Provider value={legacyValue}>{children}</TradingContext.Provider>
+      </TradingMarketContext.Provider>
+    </TradingSessionContext.Provider>
+  );
+}
+
+export function useTradingMarket() {
+  const ctx = useContext(TradingMarketContext);
+  if (!ctx) {
+    throw new Error('useTradingMarket doit être utilisé dans TradingProvider.');
+  }
+  return ctx;
+}
+
+export function useTradingSession() {
+  const ctx = useContext(TradingSessionContext);
+  if (!ctx) {
+    throw new Error('useTradingSession doit être utilisé dans TradingProvider.');
+  }
+  return ctx;
 }
 
 export function useTrading() {

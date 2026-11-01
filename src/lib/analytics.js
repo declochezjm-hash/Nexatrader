@@ -69,17 +69,25 @@ function hourlyDistribution(trades) {
   return buckets.sort((a, b) => b.pnl - a.pnl);
 }
 
-export async function computePerformanceMetrics() {
-  const trades = await fetchAllTrades();
+/** Calcul synchrone à partir d’une liste trades (SQLite ou contexte). */
+export function buildPerformanceMetrics(trades, challenge = null) {
   const closed = closedTrades(trades);
+  const open = trades.filter((t) =>
+    ['open', 'pending'].includes(String(t.status).toLowerCase()),
+  );
   const xau = trades.filter((t) => t.symbol === 'XAUUSD');
   const nas = trades.filter((t) => t.symbol === 'NAS100');
 
   const totalPnl = closed.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const wins = closed.filter((t) => (t.pnl ?? 0) > 0).length;
+  const losses = closed.filter((t) => (t.pnl ?? 0) < 0).length;
 
   return {
     totalTrades: trades.length,
     closedTrades: closed.length,
+    openTrades: open.length,
+    wins,
+    losses,
     totalPnl: Number(totalPnl.toFixed(2)),
     winRateGlobal: winRate(trades),
     winRateXAUUSD: winRate(xau),
@@ -88,7 +96,15 @@ export async function computePerformanceMetrics() {
     averageRR: averageRR(trades),
     hourlyBuckets: hourlyDistribution(trades),
     trades,
+    challengeEquity: challenge?.current_equity ?? null,
+    challengeInitial: challenge?.initial_balance ?? null,
+    computedAt: Date.now(),
   };
+}
+
+export async function computePerformanceMetrics(challenge = null) {
+  const trades = await fetchAllTrades();
+  return buildPerformanceMetrics(trades, challenge);
 }
 
 export function exportTradesJson(trades) {

@@ -1,9 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { createChart, CrosshairMode, LineStyle } from 'lightweight-charts';
-import { useTrading } from '../context/TradingContext.jsx';
-import { generateHistoricalCandles, applySimulatedTick } from '../engine/mockCandleFeed.js';
+import { useTradingMarket, useTradingSession } from '../context/TradingContext.jsx';
+import {
+  computeDynamicSpread,
+  createTwelveDataFeed,
+  generateHistoricalCandles,
+} from '../engine/twelveDataFeed.js';
 import { parseCandleFile, downloadSampleCsv } from '../lib/candleImport.js';
 import { fetchLiveCandlesFromMain, resolveMarketFeedLabel } from '../lib/marketDataClient.js';
+import {
+  isDemoMarketProvider,
+  isLiveMarketProvider,
+  normalizeMarketProvider,
+} from '../lib/marketFeedMode.js';
 import { createChartBridge } from '../lib/chartBridge.js';
 import { deleteChartDrawing, fetchChartDrawings } from '../lib/chartDrawings.js';
 import { applyDrawingDrag, HANDLE_RADIUS, hitTestDrawings } from '../lib/drawingEdit.js';
@@ -18,19 +27,16 @@ import {
   DEFAULT_BAR_SPACING,
 } from '../lib/chartView.js';
 import { isUsCashSession } from '../engine/nasdaqAnalyzer.js';
-import { SPREAD_LIMITS } from '../engine/propGuard.js';
+import {
+  findCandleIndexForTrade,
+  visibleRangeAroundIndex,
+} from '../lib/tradeChartFocus.js';
+import TradeReviewBanner from './TradeReviewBanner.jsx';
 
 /** Bougies générées / affichées par défaut (plus d’historique visible). */
 const SIM_HISTORICAL_COUNT = 480;
-
-function simulateSpread(asset, tickIndex) {
-  if (asset === 'XAUUSD') {
-    const base = 0.18 + (tickIndex % 9) * 0.03;
-    return tickIndex % 23 === 0 ? SPREAD_LIMITS.XAUUSD + 0.05 : base;
-  }
-  const base = 1.4 + (tickIndex % 6) * 0.18;
-  return tickIndex % 19 === 0 ? SPREAD_LIMITS.NAS100 + 0.3 : base;
-}
+/** Regroupe les mises à jour React du flux simulé (~20 Hz max, 60 FPS chart). */
+const TICK_UI_FLUSH_MS = 50;
 
 function buildMarkers(assetSignals) {
   return assetSignals
@@ -48,16 +54,12 @@ function buildMarkers(assetSignals) {
     });
 }
 
-export default function ChartContainer() {
+export default memo(function ChartContainer() {
   const {
     symbol,
     timeframe,
-    analyzeCandles,
     setChartBridge,
     setChartReady,
-    latestChartSignal,
-    setLatestChartSignal,
-    setInSession,
     drawingTool,
     drawings,
     setDrawings,
@@ -65,12 +67,23 @@ export default function ChartContainer() {
     setCurrentSpread,
     setActiveStopLoss,
     activeStopLoss,
-    processMarketTick,
-    settings,
     importedSeries,
     setImportedSeries,
     clearImportedSeries,
-  } = useTrading();
+    registerChartControls,
+  } = useTradingMarket();
+
+  const {
+    analyzeCandles,
+    latestChartSignal,
+    setLatestChartSignal,
+    setInSession,
+    settings,
+    processMarketTick,
+    replayActive,
+    activeTradeReview,
+    clearTradeChartReview,
+  } = useTradingSession();
 
   const wrapRef = useRef(null);
   const chartHostRef = useRef(null);
@@ -103,6 +116,15 @@ export default function ChartContainer() {
   selectedDrawingRef.current = selectedDrawingId;
   const fileInputRef = useRef(null);
   const feedRuntimeRef = useRef({ mode: 'sim' });
+  const pendingTickUiRef = useRef({
+    marketPrice: null,
+    spread: null,
+    monitorCandle: null,
+    analysisCandles: null,
+  });
+  const tickUiFlushTimerRef = useRef(null);
+  const lastAssetSignalsRef = useRef([]);
+  const tradeReviewPriceLinesRef = useRef([]);
 
   const redrawOverlay = useCallback(() => {
     const canvas = overlayRef.current;
@@ -316,7 +338,8 @@ export default function ChartContainer() {
         try {
           const windowCandles = candles.slice(-120);
           const result = await analyzeCandles(windowCandles, symbol);
-          seriesRef.current?.setMarkers(buildMarkers(result.assetSignals ?? []));
+          lastAssetSignalsRef.current = result.assetSignals ?? [];
+          seriesRef.current?.setMarkers(buildMarkers(lastAssetSignalsRef.current));
 
           const sig = result.latestSignal;
           if (sig?.stopLoss != null) {
@@ -335,6 +358,46 @@ export default function ChartContainer() {
       }, 120);
     },
     [analyzeCandles, applyGuideLines, setInSession, symbol],
+  );
+
+  const flushTickUiState = useCallback(() => {
+    tickUiFlushTimerRef.current = null;
+    const pending = pendingTickUiRef.current;
+    if (pending.marketPrice != null) {
+      setMarketPrice(pending.marketPrice);
+    }
+    if (pending.spread != null) {
+      setCurrentSpread(pending.spread);
+    }
+    if (pending.monitorCandle) {
+      void processMarketTick(pending.monitorCandle);
+    }
+    if (pending.analysisCandles) {
+      runAnalysis(pending.analysisCandles);
+    }
+    pendingTickUiRef.current = {
+      marketPrice: null,
+      spread: null,
+      monitorCandle: null,
+      analysisCandles: null,
+    };
+  }, [processMarketTick, runAnalysis, setCurrentSpread, setMarketPrice]);
+
+  const scheduleTickUiFlush = useCallback(() => {
+    if (tickUiFlushTimerRef.current != null) return;
+    tickUiFlushTimerRef.current = setTimeout(flushTickUiState, TICK_UI_FLUSH_MS);
+  }, [flushTickUiState]);
+
+  const queueTickUiUpdates = useCallback(
+    ({ marketPrice, spread, monitorCandle, analysisCandles }) => {
+      const pending = pendingTickUiRef.current;
+      if (marketPrice != null) pending.marketPrice = marketPrice;
+      if (spread != null) pending.spread = spread;
+      if (monitorCandle) pending.monitorCandle = monitorCandle;
+      if (analysisCandles) pending.analysisCandles = analysisCandles;
+      scheduleTickUiFlush();
+    },
+    [scheduleTickUiFlush],
   );
 
   useEffect(() => {
@@ -483,7 +546,7 @@ export default function ChartContainer() {
       const last0 = historical[historical.length - 1];
       if (last0) {
         setMarketPrice(last0.close);
-        setCurrentSpread(simulateSpread(symbol, 0));
+        setCurrentSpread(computeDynamicSpread(symbol, { tickIndex: 0 }));
         void processMarketTick(last0);
       }
     },
@@ -528,12 +591,13 @@ export default function ChartContainer() {
 
     const useImport =
       importedSeries?.candles?.length > 0 && importedSeries.symbol === symbol;
-    const provider = settings?.market_provider ?? 'simulated';
-    const useLive =
-      !useImport && (provider === 'twelve_data' || provider === 'finnhub');
+    const provider = normalizeMarketProvider(settings?.market_provider);
+    const useLive = !useImport && isLiveMarketProvider(provider);
+    const useDemo = !useImport && isDemoMarketProvider(provider);
 
     async function loadSeries() {
       tickRef.current = 0;
+      feedRuntimeRef.current.feed?.stop?.();
 
       if (useImport) {
         feedRuntimeRef.current = { mode: 'import' };
@@ -557,6 +621,7 @@ export default function ChartContainer() {
           if (!historical.length) {
             throw new Error('Aucune bougie reçue.');
           }
+          feedRuntimeRef.current.feed?.stop?.();
           feedRuntimeRef.current = {
             mode: 'live',
             provider,
@@ -568,23 +633,30 @@ export default function ChartContainer() {
         } catch (error) {
           if (cancelled) return;
           const msg = error instanceof Error ? error.message : 'Live indisponible.';
-          setFeedHint(`${msg} — retour simulation locale.`);
-          feedRuntimeRef.current = { mode: 'sim' };
-          applyCandlesToChart(
-            generateHistoricalCandles(symbol, timeframe, SIM_HISTORICAL_COUNT),
-          );
+          setFeedHint(`${msg} — retour flux Twelve Data local.`);
+          const feed = createTwelveDataFeed({ symbol, timeframe });
+          feed.subscribe(symbol, { timeframe });
+          const historical = generateHistoricalCandles(symbol, timeframe, SIM_HISTORICAL_COUNT);
+          feed.seedCandles(historical);
+          feedRuntimeRef.current = { mode: 'sim', feed };
+          applyCandlesToChart(historical);
           setFeedVersion((v) => v + 1);
         }
         return;
       }
 
-      feedRuntimeRef.current = { mode: 'sim' };
-      if (!cancelled) {
-        applyCandlesToChart(
-          generateHistoricalCandles(symbol, timeframe, SIM_HISTORICAL_COUNT),
-        );
-        setFeedHint('');
-        setFeedVersion((v) => v + 1);
+      if (useDemo || !useLive) {
+        const feed = createTwelveDataFeed({ symbol, timeframe });
+        feed.subscribe(symbol, { timeframe });
+        const historical = generateHistoricalCandles(symbol, timeframe, SIM_HISTORICAL_COUNT);
+        feed.seedCandles(historical);
+        feedRuntimeRef.current = { mode: 'sim', feed, demo: true };
+        if (!cancelled) {
+          applyCandlesToChart(historical);
+          setFeedHint('');
+          setFeedVersion((v) => v + 1);
+        }
+        return;
       }
     }
 
@@ -603,35 +675,14 @@ export default function ChartContainer() {
   ]);
 
   useEffect(() => {
-    if (feedPaused) return undefined;
+    if (feedPaused || replayActive) return undefined;
 
     const rt = feedRuntimeRef.current;
     if (rt.mode === 'import') return undefined;
 
     let cancelled = false;
-    let simInterval = null;
     let pollInterval = null;
-
-    const runSimTick = () => {
-      if (cancelled || feedPaused) return;
-      tickRef.current += 1;
-      const next = applySimulatedTick(
-        candlesRef.current,
-        symbol,
-        timeframe,
-        tickRef.current,
-      );
-      candlesRef.current = next;
-      const last = next[next.length - 1];
-      seriesRef.current?.update(last);
-      setMarketPrice(last.close);
-      setCurrentSpread(simulateSpread(symbol, tickRef.current));
-      void processMarketTick(last);
-      runAnalysis(next);
-      if (followLive && chartRef.current) {
-        chartRef.current.timeScale().scrollToRealTime();
-      }
-    };
+    let offTick = null;
 
     if (rt.mode === 'live') {
       pollInterval = setInterval(async () => {
@@ -647,9 +698,11 @@ export default function ChartContainer() {
           candlesRef.current = fresh;
           seriesRef.current?.setData(fresh);
           const last = fresh[fresh.length - 1];
-          setMarketPrice(last.close);
-          void processMarketTick(last);
-          runAnalysis(fresh);
+          queueTickUiUpdates({
+            marketPrice: last.close,
+            monitorCandle: last,
+            analysisCandles: fresh,
+          });
           if (followLive && chartRef.current) {
             chartRef.current.timeScale().scrollToRealTime();
           }
@@ -658,24 +711,49 @@ export default function ChartContainer() {
         }
       }, 60000);
     } else {
-      simInterval = setInterval(runSimTick, 900);
+      const feed = rt.feed;
+      if (feed) {
+        feed.stop();
+        if (candlesRef.current.length) {
+          feed.seedCandles(candlesRef.current);
+        }
+        offTick = feed.onTick((tick) => {
+          if (cancelled || feedPaused) return;
+          tickRef.current += 1;
+          candlesRef.current = tick.candles;
+          seriesRef.current?.update(tick.candle);
+          queueTickUiUpdates({
+            marketPrice: tick.price,
+            spread: tick.spread,
+            monitorCandle: tick.candle,
+            analysisCandles: tick.candles,
+          });
+          if (followLive && chartRef.current) {
+            chartRef.current.timeScale().scrollToRealTime();
+          }
+        });
+        feed.start(900);
+      }
     }
 
     return () => {
       cancelled = true;
-      if (simInterval) clearInterval(simInterval);
       if (pollInterval) clearInterval(pollInterval);
+      offTick?.();
+      rt.feed?.stop?.();
+      if (tickUiFlushTimerRef.current) {
+        clearTimeout(tickUiFlushTimerRef.current);
+        tickUiFlushTimerRef.current = null;
+      }
     };
   }, [
     feedPaused,
+    replayActive,
     feedVersion,
     symbol,
     timeframe,
     followLive,
-    runAnalysis,
-    setMarketPrice,
-    setCurrentSpread,
-    processMarketTick,
+    queueTickUiUpdates,
   ]);
 
   const feedIsStatic =
@@ -689,6 +767,83 @@ export default function ChartContainer() {
     }
   };
 
+  const clearTradeReviewOverlay = useCallback(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    for (const line of tradeReviewPriceLinesRef.current) {
+      series.removePriceLine(line);
+    }
+    tradeReviewPriceLinesRef.current = [];
+    series.setMarkers(buildMarkers(lastAssetSignalsRef.current));
+  }, []);
+
+  const applyTradeFocusOnChart = useCallback(
+    (trade) => {
+      const chart = chartRef.current;
+      const series = seriesRef.current;
+      if (!chart || !series || !trade) return;
+
+      pauseDirect();
+
+      const candles = candlesRef.current;
+      if (!candles.length) return;
+
+      const idx = findCandleIndexForTrade(candles, trade);
+      chart.timeScale().setVisibleLogicalRange(visibleRangeAroundIndex(idx, candles.length));
+
+      for (const line of tradeReviewPriceLinesRef.current) {
+        series.removePriceLine(line);
+      }
+      tradeReviewPriceLinesRef.current = [];
+
+      const pushLine = (price, color, title) => {
+        if (price == null || price === '') return;
+        const n = Number(price);
+        if (!Number.isFinite(n)) return;
+        tradeReviewPriceLinesRef.current.push(
+          series.createPriceLine({
+            price: n,
+            color,
+            lineWidth: 2,
+            axisLabelVisible: true,
+            title,
+          }),
+        );
+      };
+
+      pushLine(
+        trade.entry_price,
+        trade.type === 'BUY' ? '#22c55e' : '#f43f5e',
+        `Entrée #${trade.id}`,
+      );
+      pushLine(trade.stop_loss, '#f97316', 'SL trade');
+      pushLine(trade.take_profit, '#a78bfa', 'TP');
+      pushLine(trade.exit_price, '#38bdf8', 'Sortie');
+
+      const barTime = candles[idx]?.time;
+      const markers = [...buildMarkers(lastAssetSignalsRef.current)];
+      if (barTime != null) {
+        markers.push({
+          time: barTime,
+          position: trade.type === 'BUY' ? 'belowBar' : 'aboveBar',
+          color: trade.type === 'BUY' ? '#22c55e' : '#f43f5e',
+          shape: trade.type === 'BUY' ? 'arrowUp' : 'arrowDown',
+          text: `#${trade.id}`,
+        });
+        markers.sort((a, b) => a.time - b.time);
+      }
+      series.setMarkers(markers);
+
+      if (trade.stop_loss != null && Number.isFinite(Number(trade.stop_loss))) {
+        const sl = Number(trade.stop_loss);
+        setSlPrice(sl);
+        setActiveStopLoss(sl);
+        applyGuideLines(sl, bePrice);
+      }
+    },
+    [applyGuideLines, bePrice, setActiveStopLoss],
+  );
+
   const resumeDirect = () => {
     setFeedPaused(false);
     setFollowLive(true);
@@ -697,6 +852,45 @@ export default function ChartContainer() {
       chartRef.current.timeScale().scrollToRealTime();
     }
   };
+
+  useEffect(() => {
+    if (!activeTradeReview?.trade || !activeTradeReview.seq) return;
+    const trade = activeTradeReview.trade;
+    if (trade.symbol !== symbol) return;
+    if (!candlesRef.current.length) return;
+    applyTradeFocusOnChart(trade);
+  }, [activeTradeReview, symbol, feedVersion, applyTradeFocusOnChart]);
+
+  useEffect(() => {
+    registerChartControls({
+      zoomIn: () => adjustZoom(chartRef.current, barSpacingRef, 'in'),
+      zoomOut: () => adjustZoom(chartRef.current, barSpacingRef, 'out'),
+      pauseFeed: pauseDirect,
+      resumeFeed: resumeDirect,
+      captureForReplay: () => {
+        pauseDirect();
+        return [...candlesRef.current];
+      },
+      applyReplayFrame: (frame, candles) => {
+        const source = candles ?? candlesRef.current;
+        const slice = source.slice(0, frame);
+        if (slice.length) {
+          seriesRef.current?.setData(slice);
+          redrawOverlay();
+        }
+      },
+      clearTradeReviewOverlay,
+      applyTradeFocusOnChart,
+    });
+    return () => registerChartControls(null);
+  }, [
+    registerChartControls,
+    feedPaused,
+    followLive,
+    clearTradeReviewOverlay,
+    applyTradeFocusOnChart,
+    redrawOverlay,
+  ]);
 
   const feedBadge = resolveMarketFeedLabel(
     settings,
@@ -1076,7 +1270,18 @@ export default function ChartContainer() {
           className="pointer-events-none absolute inset-0 z-[2]"
           aria-hidden
         />
+        {activeTradeReview?.trade && (
+          <TradeReviewBanner
+            review={activeTradeReview}
+            onClose={clearTradeChartReview}
+            onOpenDetails={(id) => {
+              window.dispatchEvent(
+                new CustomEvent('nexatrader:open-trade', { detail: { tradeId: id } }),
+              );
+            }}
+          />
+        )}
       </div>
     </div>
   );
-}
+});

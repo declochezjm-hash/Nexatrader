@@ -9,6 +9,7 @@
     "dev:vite": "vite",
     "dev:electron": "wait-on tcp:5173 && cross-env NODE_ENV=development electron .",
     "build": "vite build",
+    "test:pretrade": "node scripts/test-pretrade-validation.mjs",
     "start": "cross-env NODE_ENV=production electron .",
     "postinstall": "electron-builder install-app-deps"
   },

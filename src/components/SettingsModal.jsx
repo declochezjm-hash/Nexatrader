@@ -1,17 +1,27 @@
-import { useEffect, useRef, useState } from 'react';
-import { X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CheckCircle2, Circle, X } from 'lucide-react';
 import { useTrading } from '../context/TradingContext.jsx';
+import { PARAMETRES_A_COMPLETER, TUTORIAL_STORAGE_KEY } from '../lib/tutorialContent.js';
+import { setSkipPreTradeChecklist } from '../lib/preTradeChecklist.js';
 import { testGeminiConnection } from '../engine/aiService.js';
 import GoogleSignInButton from './GoogleSignInButton.jsx';
 import { loginWithGoogleIpc, waitForElectronBridge, getElectronEnvironmentHint } from '../lib/electronBridge.js';
 import { testMarketConnectionFromMain } from '../lib/marketDataClient.js';
 import { DEFAULT_GEMINI_SETTINGS_ID, normalizeGeminiSettingsId } from '../lib/geminiModels.js';
 import { WGF_READY_DEFAULTS } from '../lib/db.js';
+import {
+  isDemoMarketProvider,
+  isLiveMarketProvider,
+  normalizeMarketProvider,
+} from '../lib/marketFeedMode.js';
 
 const MARKET_PROVIDERS = [
-  { id: 'simulated', label: 'Simulation locale (gratuit, sans clé)' },
-  { id: 'twelve_data', label: 'Twelve Data — live (clé gratuite)' },
-  { id: 'finnhub', label: 'Finnhub — live (clé gratuite)' },
+  {
+    id: 'twelve_data_demo',
+    label: 'Twelve Data — démo (sans clé, flux réaliste XAU / NAS)',
+  },
+  { id: 'twelve_data', label: 'Twelve Data — live (clé API gratuite)' },
+  { id: 'finnhub', label: 'Finnhub — live (clé API gratuite)' },
 ];
 
 const AI_PROVIDERS = [
@@ -27,6 +37,7 @@ export default function SettingsModal() {
   const {
     settingsOpen,
     setSettingsOpen,
+    setTutorialOpen,
     settings,
     challenge,
     updateSettings,
@@ -51,7 +62,7 @@ export default function SettingsModal() {
   const [maxOverall, setMaxOverall] = useState('10');
   const [challengeMsg, setChallengeMsg] = useState('');
   const [challengeBusy, setChallengeBusy] = useState(false);
-  const [marketProvider, setMarketProvider] = useState('simulated');
+  const [marketProvider, setMarketProvider] = useState('twelve_data_demo');
   const [marketApiKey, setMarketApiKey] = useState('');
   const [testingMarket, setTestingMarket] = useState(false);
   const [marketTestMessage, setMarketTestMessage] = useState('');
@@ -81,7 +92,7 @@ export default function SettingsModal() {
     setPaperTrading(settings.paper_trading == null || Number(settings.paper_trading) === 1);
     setGoogleEmail(settings.google_account_email ?? '');
     setGoogleClientId(settings.google_oauth_client_id ?? '');
-    setMarketProvider(settings.market_provider ?? 'simulated');
+    setMarketProvider(normalizeMarketProvider(settings.market_provider));
     setMarketApiKey(settings.market_api_key ?? '');
     const storedKey = settings.api_key;
     setGeminiApiKey(storedKey && storedKey !== 'google_oauth' ? storedKey : '');
@@ -116,14 +127,57 @@ export default function SettingsModal() {
     };
   }, [settingsOpen]);
 
-  if (!settingsOpen) return null;
-
   const googleConnected =
     Boolean(settings?.google_access_token) || settings?.api_key === 'google_oauth';
 
   const geminiKeyStored =
     Boolean(settings?.api_key && settings.api_key !== 'google_oauth') ||
     Boolean(geminiApiKey.trim());
+
+  const parametresCtx = useMemo(
+    () => ({
+      challenge,
+      marketOk:
+        isDemoMarketProvider(marketProvider) ||
+        (isLiveMarketProvider(marketProvider) &&
+          Boolean(marketApiKey.trim() || settings?.market_api_key?.trim())),
+      geminiOk: googleConnected || geminiKeyStored || geminiEnvKey,
+      riskOk: Number(riskPercent) >= 0.1 && Number(riskPercent) <= 5,
+    }),
+    [
+      challenge,
+      marketProvider,
+      marketApiKey,
+      settings?.market_api_key,
+      googleConnected,
+      geminiKeyStored,
+      geminiEnvKey,
+      riskPercent,
+    ],
+  );
+
+  if (!settingsOpen) return null;
+
+  function openTutorialFromSettings() {
+    setSettingsOpen(false);
+    setTutorialOpen(true);
+  }
+
+  function reenablePreTradeChecklist() {
+    setSkipPreTradeChecklist(false);
+    setSaveOk(true);
+    setSaveMsg('Checklist pré-ordre réactivée (affichée avant chaque ordre).');
+  }
+
+  function resetTutorialAutoShow() {
+    try {
+      localStorage.removeItem(TUTORIAL_STORAGE_KEY);
+    } catch {
+      /* ignore */
+    }
+    setSaveOk(true);
+    setSaveMsg('Le tutoriel s’ouvrira automatiquement au prochain lancement de l’app.');
+  }
 
   function openGoogleAiStudio() {
     window.nexaTrader?.app?.openExternal?.('https://aistudio.google.com/apikey');
@@ -281,9 +335,11 @@ export default function SettingsModal() {
     setMarketTestMessage('');
     setMarketTestOk(null);
     try {
-      if (marketProvider === 'simulated') {
+      if (isDemoMarketProvider(marketProvider)) {
         setMarketTestOk(true);
-        setMarketTestMessage('Mode simulation — aucune clé requise.');
+        setMarketTestMessage(
+          'Mode démo Twelve Data actif — ticks, spread et sessions simulés. Aucune clé requise.',
+        );
         return;
       }
       const ready = await waitForElectronBridge(3000);
@@ -327,7 +383,7 @@ export default function SettingsModal() {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
       <div
-        className="w-full max-w-lg rounded-xl border border-slate-700 bg-slate-900 shadow-xl"
+        className="w-full max-w-xl rounded-xl border border-slate-700 bg-slate-900 shadow-xl"
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-title"
@@ -347,10 +403,68 @@ export default function SettingsModal() {
         </div>
         <form onSubmit={handleSave} className="flex max-h-[85vh] flex-col">
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+          <fieldset className="space-y-3 rounded-xl border border-amber-500/25 bg-amber-500/5 p-3">
+            <legend className="px-1 text-xs font-semibold uppercase tracking-wide text-amber-300">
+              Guide & paramétrage à compléter
+            </legend>
+            <p className="text-[10px] leading-relaxed text-slate-400">
+              Suivez cette liste avant votre première session sérieuse. Les cases vertes indiquent ce
+              qui est déjà OK dans ce formulaire.
+            </p>
+            <ul className="space-y-2">
+              {PARAMETRES_A_COMPLETER.map((item) => {
+                const complete = item.done(parametresCtx);
+                return (
+                  <li
+                    key={item.id}
+                    className="flex gap-2 rounded-lg border border-slate-800/80 bg-slate-950/50 px-2.5 py-2"
+                  >
+                    {complete ? (
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+                    ) : (
+                      <Circle className="mt-0.5 h-4 w-4 shrink-0 text-slate-600" />
+                    )}
+                    <div>
+                      <p className="text-[11px] font-medium text-slate-200">{item.title}</p>
+                      <p className="mt-0.5 text-[10px] leading-relaxed text-slate-500">{item.help}</p>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="flex flex-wrap gap-2 pt-1">
+              <button
+                type="button"
+                onClick={openTutorialFromSettings}
+                className="rounded-lg border border-emerald-600/40 bg-emerald-600/15 px-3 py-1.5 text-[11px] text-emerald-200 hover:bg-emerald-600/25"
+              >
+                Ouvrir le tutoriel complet
+              </button>
+              <button
+                type="button"
+                onClick={reenablePreTradeChecklist}
+                className="rounded-lg border border-slate-600 px-3 py-1.5 text-[11px] text-slate-300 hover:border-slate-400"
+              >
+                Réactiver checklist pré-ordre
+              </button>
+              <button
+                type="button"
+                onClick={resetTutorialAutoShow}
+                className="rounded-lg border border-slate-600 px-3 py-1.5 text-[11px] text-slate-300 hover:border-slate-400"
+              >
+                Réafficher tutoriel au démarrage
+              </button>
+            </div>
+          </fieldset>
+
           <fieldset className="space-y-3 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3">
             <legend className="px-1 text-xs font-semibold uppercase tracking-wide text-emerald-400">
               Challenge prop (WGF)
             </legend>
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              Règles type WGF : objectif de profit, plafond de perte journalière et drawdown total.
+              « Nouveau challenge » repart du capital saisi sans effacer le journal.
+            </p>
             {challenge ? (
               <p className="text-[10px] text-slate-400">
                 Statut :{' '}
@@ -438,14 +552,16 @@ export default function SettingsModal() {
               Données marché
             </legend>
             <p className="text-[10px] leading-relaxed text-slate-500">
-              Live gratuit avec inscription (quotas API). Sinon importez un CSV/JSON depuis le
-              graphique (glisser-déposer ou bouton Importer).
+              Choisissez le <strong className="font-medium text-sky-300/90">mode démo</strong>{' '}
+              (flux Twelve Data simulé, entraînement sans clé) ou un{' '}
+              <strong className="font-medium text-emerald-300/90">live API</strong> (cotes réelles
+              via Electron). Import CSV possible sur le graphique dans tous les cas.
             </p>
             <label className="block text-xs text-slate-400">
               Source des bougies
               <select
                 value={marketProvider}
-                onChange={(e) => setMarketProvider(e.target.value)}
+                onChange={(e) => setMarketProvider(normalizeMarketProvider(e.target.value))}
                 className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100"
               >
                 {MARKET_PROVIDERS.map((p) => (
@@ -455,7 +571,13 @@ export default function SettingsModal() {
                 ))}
               </select>
             </label>
-            {marketProvider !== 'simulated' && (
+            {isDemoMarketProvider(marketProvider) && (
+              <p className="rounded-lg border border-sky-500/25 bg-sky-500/10 px-3 py-2 text-[10px] text-sky-100/90">
+                Démo : ticks XAUUSD / NAS100, spread dynamique et sessions — identique au moteur
+                Twelve Data local de NexaTrader. Enregistrez pour appliquer au graphique.
+              </p>
+            )}
+            {isLiveMarketProvider(marketProvider) && (
               <>
                 <label className="block text-xs text-slate-400">
                   Clé API marché
@@ -500,14 +622,14 @@ export default function SettingsModal() {
                 </button>
               </>
             )}
-            {marketProvider === 'simulated' && (
+            {isDemoMarketProvider(marketProvider) && (
               <button
                 type="button"
                 disabled={testingMarket}
                 onClick={handleTestMarket}
                 className="w-full rounded-lg border border-slate-600 px-3 py-2 text-[11px] text-slate-300 disabled:opacity-50"
               >
-                Vérifier le mode simulation
+                Vérifier le mode démo
               </button>
             )}
             {marketTestMessage && (
@@ -517,6 +639,14 @@ export default function SettingsModal() {
             )}
           </fieldset>
 
+          <fieldset className="space-y-3 rounded-xl border border-violet-500/15 bg-violet-500/5 p-3">
+            <legend className="px-1 text-xs font-semibold uppercase tracking-wide text-violet-300">
+              Intelligence artificielle
+            </legend>
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              Score PropGuard, résumé journalier et Coach IA. Erreur 429 = quota Gemini : attendez 1–2
+              minutes ou utilisez le fallback SQLite affiché sur la carte IA.
+            </p>
           <label className="block text-xs text-slate-400">
             Fournisseur IA
             <select
@@ -654,7 +784,17 @@ export default function SettingsModal() {
               {aiTestMessage}
             </p>
           )}
+          </fieldset>
 
+          <fieldset className="space-y-3 rounded-xl border border-orange-500/20 bg-orange-500/5 p-3">
+            <legend className="px-1 text-xs font-semibold uppercase tracking-wide text-orange-300">
+              Trading & discipline
+            </legend>
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              Le risque % alimente le calculateur de lot PropGuard. Paper = entraînement ; Auto-Pilot
+              ne doit rester activé que si vous acceptez des ordres préparés automatiquement (score ≥
+              80 %).
+            </p>
           <label className="block text-xs text-slate-400">
             Risque par trade (%)
             <input
@@ -685,6 +825,7 @@ export default function SettingsModal() {
             />
             Auto-Pilot — préparer l&apos;ordre si score IA ≥ 80 %
           </label>
+          </fieldset>
           </div>
           <div className="shrink-0 space-y-2 border-t border-slate-800 bg-slate-900 px-4 py-3">
             {saveMsg && (

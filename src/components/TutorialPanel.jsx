@@ -3,18 +3,38 @@ import {
   BookOpen,
   ChevronLeft,
   ChevronRight,
+  ClipboardList,
   Lightbulb,
   X,
+  CheckCircle2,
+  Circle,
 } from 'lucide-react';
 import { useTrading } from '../context/TradingContext.jsx';
-import { TRADING_TIPS, TUTORIAL_STEPS } from '../lib/tutorialContent.js';
+import { isDemoMarketProvider, normalizeMarketProvider } from '../lib/marketFeedMode.js';
+import { PARAMETRES_A_COMPLETER, TRADING_TIPS, TUTORIAL_STEPS } from '../lib/tutorialContent.js';
 
 export default function TutorialPanel() {
-  const { tutorialOpen, setTutorialOpen } = useTrading();
+  const { tutorialOpen, setTutorialOpen, setSettingsOpen, settings, challenge } = useTrading();
   const [tab, setTab] = useState('tutorial');
   const [stepIndex, setStepIndex] = useState(0);
 
   const step = TUTORIAL_STEPS[stepIndex];
+  const parametresCtx = useMemo(
+    () => ({
+      challenge,
+      marketOk:
+        isDemoMarketProvider(normalizeMarketProvider(settings?.market_provider)) ||
+        Boolean(settings?.market_api_key?.trim()),
+      geminiOk:
+        Boolean(settings?.google_access_token) ||
+        settings?.api_key === 'google_oauth' ||
+        Boolean(settings?.api_key && settings.api_key !== 'google_oauth'),
+      riskOk:
+        Number(settings?.default_risk_percent ?? 1) >= 0.1 &&
+        Number(settings?.default_risk_percent ?? 1) <= 5,
+    }),
+    [challenge, settings],
+  );
   const tipsByCategory = useMemo(() => {
     const map = new Map();
     for (const tip of TRADING_TIPS) {
@@ -79,6 +99,18 @@ export default function TutorialPanel() {
             <Lightbulb className="h-4 w-4" />
             Conseils
           </button>
+          <button
+            type="button"
+            onClick={() => setTab('setup')}
+            className={`inline-flex items-center gap-1.5 rounded-t-lg px-3 py-2 text-sm font-medium ${
+              tab === 'setup'
+                ? 'bg-slate-800 text-sky-300'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <ClipboardList className="h-4 w-4" />
+            Paramétrage
+          </button>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
@@ -133,6 +165,47 @@ export default function TutorialPanel() {
                   </ul>
                 </section>
               ))}
+            </div>
+          )}
+
+          {tab === 'setup' && (
+            <div className="space-y-4">
+              <p className="text-sm text-slate-400">
+                Checklist de première configuration. Ouvrez{' '}
+                <strong className="font-medium text-slate-200">Paramètres</strong> pour compléter
+                chaque point ; l’état se met à jour selon votre profil SQLite.
+              </p>
+              <ul className="space-y-2">
+                {PARAMETRES_A_COMPLETER.map((item) => {
+                  const complete = item.done(parametresCtx);
+                  return (
+                    <li
+                      key={item.id}
+                      className="flex gap-2 rounded-xl border border-slate-800 bg-slate-950/60 p-3"
+                    >
+                      {complete ? (
+                        <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+                      ) : (
+                        <Circle className="mt-0.5 h-4 w-4 shrink-0 text-slate-600" />
+                      )}
+                      <div>
+                        <p className="text-sm font-medium text-slate-100">{item.title}</p>
+                        <p className="mt-1 text-xs leading-relaxed text-slate-400">{item.help}</p>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+              <button
+                type="button"
+                onClick={() => {
+                  setTutorialOpen(false);
+                  setSettingsOpen(true);
+                }}
+                className="w-full rounded-lg bg-sky-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-sky-500"
+              >
+                Ouvrir Paramètres
+              </button>
             </div>
           )}
         </div>

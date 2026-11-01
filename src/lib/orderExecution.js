@@ -2,6 +2,7 @@ import { getDb } from './db.js';
 import { canOpenTrade } from '../engine/propGuard.js';
 import { calculateLotSize } from '../engine/positionSizer.js';
 import { syncChallengeEquity } from './challengeEquity.js';
+import { validateStopLossForSide } from './preTradeValidation.js';
 
 /**
  * Ouvre un ordre mémorisé en SQLite avec taille calculée PropGuard.
@@ -41,6 +42,11 @@ export async function executeOpenOrder({
   const sl =
     stopLossPrice ??
     (side === 'BUY' ? entry - 5 : entry + 5);
+
+  const slCheck = validateStopLossForSide(side, entry, sl);
+  if (!slCheck.valid) {
+    return { ok: false, error: slCheck.message, gate, slCheck };
+  }
 
   const riskPercent = settings?.default_risk_percent ?? 1;
   const balance = challenge?.current_equity ?? challenge?.initial_balance ?? 0;

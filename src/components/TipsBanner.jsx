@@ -7,7 +7,7 @@ const DISMISS_KEY = 'nexatrader_tip_banner_dismissed';
 
 /** Conseil du jour rotatif dans le panneau PropGuard. */
 export default function TipsBanner() {
-  const { setTutorialOpen } = useTrading();
+  const { setTutorialOpen, setCoachOpen } = useTrading();
   const [dismissed, setDismissed] = useState(() => {
     try {
       return localStorage.getItem(DISMISS_KEY) === '1';
@@ -51,9 +51,16 @@ export default function TipsBanner() {
       <button
         type="button"
         onClick={() => setTutorialOpen(true)}
-        className="mt-2 text-[11px] font-medium text-sky-400 hover:text-sky-300"
+        className="mt-2 mr-2 text-[11px] font-medium text-sky-400 hover:text-sky-300"
       >
-        Ouvrir le tutoriel complet →
+        Tutoriel complet →
+      </button>
+      <button
+        type="button"
+        onClick={() => setCoachOpen(true)}
+        className="mt-2 text-[11px] font-medium text-violet-400 hover:text-violet-300"
+      >
+        Poser une question au coach →
       </button>
     </div>
   );

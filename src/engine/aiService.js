@@ -1,4 +1,5 @@
 import { DEFAULT_GEMINI_SETTINGS_ID, geminiApiModelsToTry } from '../lib/geminiModels.js';
+import { formatGeminiUserMessage, isGeminiQuotaError } from '../lib/geminiErrors.js';
 
 const JSON_SCHEMA_HINT = `{
   "confidenceScore": 85,
@@ -80,7 +81,7 @@ function fallbackAnalysis(candleData, historicalStats) {
   };
 }
 
-async function invokeGemini(apiKey, accessToken, prompt, aiProvider) {
+async function invokeGemini(apiKey, accessToken, prompt, aiProvider, options = {}) {
   if (typeof window !== 'undefined' && window.nexaTrader?.ai?.gemini) {
     const res = await window.nexaTrader.ai.gemini({
       apiKey,
@@ -102,12 +103,20 @@ async function invokeGemini(apiKey, accessToken, prompt, aiProvider) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+        contents: options.contents ?? [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: options.temperature ?? 0.2,
+          ...(options.responseMimeType
+            ? { responseMimeType: options.responseMimeType }
+            : {}),
+        },
       }),
     });
     if (!response.ok) {
       const errText = await response.text();
+      if (isGeminiQuotaError(response.status, errText)) {
+        throw new Error(formatGeminiUserMessage({ status: response.status, body: errText }));
+      }
       lastError = new Error(`Gemini HTTP ${response.status}: ${errText.slice(0, 200)}`);
       if (response.status === 404 || errText.toLowerCase().includes('not found')) {
         continue;
@@ -142,7 +151,9 @@ export async function analyzePattern(candleData, historicalStats, settings = {})
 
   try {
     const prompt = buildPrompt(candleData, historicalStats);
-    const raw = await invokeGemini(apiKey, accessToken, prompt, provider);
+    const raw = await invokeGemini(apiKey, accessToken, prompt, provider, {
+      responseMimeType: 'application/json',
+    });
     const parsed = parseGeminiJson(raw);
 
     return {
@@ -155,6 +166,8 @@ export async function analyzePattern(candleData, historicalStats, settings = {})
     return fallbackAnalysis(candleData, historicalStats);
   }
 }
+
+export { resolveGeminiAuth, invokeGemini };
 
 export function toAiInsight(analysis) {
   return {
@@ -185,13 +198,15 @@ export async function testGeminiConnection(settingsOrKey) {
   const trimmedKey = apiKey?.trim() ?? apiKey;
 
   try {
-    const raw = await invokeGemini(trimmedKey, accessToken, prompt, settings.ai_provider);
+    const raw = await invokeGemini(trimmedKey, accessToken, prompt, settings.ai_provider, {
+      responseMimeType: 'application/json',
+    });
     parseGeminiJson(raw);
     return { ok: true, message: 'Connexion Gemini opérationnelle (modèles Flash).' };
   } catch (error) {
     return {
       ok: false,
-      message: error instanceof Error ? error.message : 'Échec du test Gemini.',
+      message: formatGeminiUserMessage(error),
     };
   }
 }
