@@ -37,7 +37,17 @@ function buildEventDate(baseDate, hourUtc, minuteUtc) {
  * @param {Date} [referenceDate]
  * @returns {Array<{ code: string, label: string, timeUtc: Date, symbols: string[] }>}
  */
+let externalCalendarEvents = null;
+
+export function setExternalEconomicCalendar(events) {
+  externalCalendarEvents = Array.isArray(events) ? events : null;
+}
+
 export function getHighImpactEvents(referenceDate = new Date()) {
+  if (externalCalendarEvents?.length) {
+    return [...externalCalendarEvents].sort((a, b) => a.timeUtc - b.timeUtc);
+  }
+
   const year = referenceDate.getUTCFullYear();
   const month = referenceDate.getUTCMonth();
   const symbols = ['XAUUSD', 'NAS100'];
@@ -114,4 +124,19 @@ export function getUpcomingNews(symbol, withinHours = 24, now = new Date()) {
       e.timeUtc.getTime() >= now.getTime() &&
       e.timeUtc.getTime() - now.getTime() <= horizon,
   );
+}
+
+/**
+ * Annonces à fort impact dans les prochaines minutes (tous actifs).
+ * @param {Date} [now]
+ * @param {number} [withinMinutes]
+ */
+export function getUpcomingHighImpactEvents(now = new Date(), withinMinutes = 60) {
+  const events = getHighImpactEvents(now);
+  const nowMs = now.getTime();
+  const horizon = withinMinutes * 60 * 1000;
+  return events.filter((e) => {
+    const t = e.timeUtc.getTime();
+    return t >= nowMs - 15 * 60 * 1000 && t - nowMs <= horizon;
+  });
 }

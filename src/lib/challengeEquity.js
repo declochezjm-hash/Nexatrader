@@ -5,12 +5,33 @@ import {
   nextAntiTiltUntil,
   ANTI_TILT_LOSS_THRESHOLD,
 } from '../engine/propGuard.js';
-import { estimatePnl } from '../engine/positionSizer.js';
+import { evaluateDailyReset } from './wgfDailyReset.js';
+import { evaluateProfitTargetPass } from './wgfProfitTarget.js';
+import {
+  challengeUsesEodTrailing,
+  computeInitialEodFloor,
+  evaluateEodMidnightRollover,
+} from './wgfEodTrailing.js';
+import { getGmtDateKey } from './wgfDailyReset.js';
+import { appendWgfAuditEntry } from './wgfAuditLog.js';
 
 export async function fetchAllTradesForEquity() {
   const db = getDb();
   if (!db) return [];
-  return db.query(`SELECT id, pnl, status, type, symbol, lot_size, entry_price FROM trades`);
+  return db.query(
+    `SELECT id, pnl, status, type, symbol, lot_size, entry_price, created_at FROM trades`,
+  );
+}
+
+async function persistChallengeEquityFields(db, challengeId, fields) {
+  const sets = [];
+  const params = [];
+  for (const [key, value] of Object.entries(fields)) {
+    sets.push(`${key} = ?`);
+    params.push(value);
+  }
+  params.push(challengeId);
+  await db.run(`UPDATE local_challenge SET ${sets.join(', ')} WHERE id = ?`, params);
 }
 
 /**
@@ -22,31 +43,131 @@ export async function syncChallengeEquity(challenge) {
 
   const trades = await fetchAllTradesForEquity();
   const equity = computeEquityFromTrades(challenge, trades);
-  const failCheck = shouldFailChallenge(challenge, equity);
+
+  if (challenge.status === 'failed') {
+    return { ...challenge, current_equity: equity, last_equity_snapshot: equity };
+  }
+
+  if (challenge.status === 'passed') {
+    await persistChallengeEquityFields(db, challenge.id, {
+      current_equity: equity,
+      last_equity_snapshot: equity,
+    });
+    return { ...challenge, current_equity: equity, last_equity_snapshot: equity };
+  }
+
+  let working = challenge;
+  let eodMessage = null;
+  let dailyMessage = null;
+
+  const eodEval = evaluateEodMidnightRollover(working, equity);
+  if (eodEval.apply) {
+    await persistChallengeEquityFields(db, challenge.id, {
+      eod_trailing_floor: eodEval.newFloor,
+      last_eod_process_gmt: eodEval.todayKey,
+      last_equity_snapshot: equity,
+    });
+    working = eodEval.challenge;
+    eodMessage = eodEval.message;
+    await appendWgfAuditEntry({
+      challengeId: challenge.id,
+      eventType: 'eod_rollover',
+      title: 'Plancher EOD recalculé',
+      detail: eodMessage,
+      equity,
+    });
+  }
+
+  const resetEval = evaluateDailyReset(working, equity);
+  if (resetEval.apply) {
+    await persistChallengeEquityFields(db, challenge.id, {
+      starting_daily_balance: equity,
+      last_daily_reset_gmt: resetEval.todayKey,
+      current_equity: equity,
+      last_equity_snapshot: equity,
+    });
+    working = resetEval.challenge;
+    dailyMessage = resetEval.message;
+    await appendWgfAuditEntry({
+      challengeId: challenge.id,
+      eventType: 'daily_reset',
+      title: 'Reset journalier 00:00 GMT',
+      detail: dailyMessage,
+      equity,
+    });
+  }
+
+  const failCheck = shouldFailChallenge(working, equity);
 
   if (failCheck.fail) {
     await db.run(
       `UPDATE local_challenge SET
         current_equity = ?,
+        last_equity_snapshot = ?,
         status = 'failed',
         failure_reason = ?
        WHERE id = ?`,
-      [equity, failCheck.reason, challenge.id],
+      [equity, equity, failCheck.reason, challenge.id],
     );
+    await appendWgfAuditEntry({
+      challengeId: challenge.id,
+      eventType: 'phase_fail',
+      title: 'Challenge FAILED',
+      detail: failCheck.reason,
+      equity,
+    });
     return {
-      ...challenge,
+      ...working,
       current_equity: equity,
+      last_equity_snapshot: equity,
       status: 'failed',
       failure_reason: failCheck.reason,
     };
   }
 
-  await db.run(`UPDATE local_challenge SET current_equity = ? WHERE id = ?`, [
-    equity,
-    challenge.id,
-  ]);
+  const passCheck = evaluateProfitTargetPass(working, equity, trades);
+  if (passCheck.pass) {
+    await db.run(
+      `UPDATE local_challenge SET
+        current_equity = ?,
+        last_equity_snapshot = ?,
+        status = 'passed',
+        pass_reason = ?,
+        failure_reason = NULL
+       WHERE id = ?`,
+      [equity, equity, passCheck.message, challenge.id],
+    );
+    await appendWgfAuditEntry({
+      challengeId: challenge.id,
+      eventType: 'phase_pass',
+      title: 'Objectif WGF atteint',
+      detail: passCheck.message,
+      equity,
+    });
+    return {
+      ...working,
+      current_equity: equity,
+      last_equity_snapshot: equity,
+      status: 'passed',
+      pass_reason: passCheck.message,
+      failure_reason: null,
+      _profitPassMessage: passCheck.message,
+      _profitPassNext: passCheck.nextPhase,
+    };
+  }
 
-  return { ...challenge, current_equity: equity };
+  await persistChallengeEquityFields(db, working.id, {
+    current_equity: equity,
+    last_equity_snapshot: equity,
+  });
+
+  return {
+    ...working,
+    current_equity: equity,
+    last_equity_snapshot: equity,
+    _eodResetMessage: eodMessage,
+    _dailyResetMessage: dailyMessage,
+  };
 }
 
 export async function registerClosedTradePnl(tradeId, pnl, challenge, exitPrice = null) {
@@ -89,4 +210,16 @@ export async function registerClosedTradePnl(tradeId, pnl, challenge, exitPrice 
   };
 
   return syncChallengeEquity(updated);
+}
+
+export function buildChallengeTrackingFields(programId, initialBalance) {
+  const balance = Number(initialBalance);
+  const today = getGmtDateKey();
+  const stub = { wgf_program_id: programId, initial_balance: balance };
+  return {
+    last_daily_reset_gmt: today,
+    last_eod_process_gmt: today,
+    last_equity_snapshot: balance,
+    eod_trailing_floor: challengeUsesEodTrailing(stub) ? computeInitialEodFloor(stub) : null,
+  };
 }

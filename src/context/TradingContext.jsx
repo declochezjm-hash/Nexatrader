@@ -5,8 +5,12 @@ import { ensureActiveChallenge } from '../lib/challengeBootstrap.js';
 import {
   resetChallengeWithCapital,
   updateActiveChallengeLimits,
+  applyWgfProgramToActiveChallenge,
+  advanceWgfPhaseAfterPass,
+  setOneDayPassOnActiveChallenge,
 } from '../lib/challengeSettings.js';
 import { canOpenTrade, resolveSession } from '../engine/propGuard.js';
+import { resolveWgfEnforcementMode } from '../lib/wgfEnforcement.js';
 import { executeKillSwitch as runKillSwitch } from '../lib/executeKillSwitch.js';
 import { resumeAfterKillSwitch as runResumeAfterKillSwitch } from '../lib/resumeAfterKillSwitch.js';
 import { executeOpenOrder, refreshEquityState } from '../lib/orderExecution.js';
@@ -23,6 +27,15 @@ import { computeWgfDisciplineScore } from '../lib/disciplineScore.js';
 import { shouldSkipPreTradeChecklist, setSkipPreTradeChecklist } from '../lib/preTradeChecklist.js';
 import { fetchTradeDetail } from '../lib/tradeJournalAdmin.js';
 import { compareTradeDecision } from '../lib/tradeDecisionCompare.js';
+import { serializePlanSnapshot } from '../lib/twinTrade.js';
+import { refreshEconomicCalendarFromSettings } from '../lib/economicCalendarClient.js';
+import {
+  DEFAULT_WGF_PROGRAM_ID,
+  getWgfProgram,
+  limitsForProgram,
+} from '../lib/wgfPrograms.js';
+import { buildChallengeTrackingFields } from '../lib/challengeEquity.js';
+import { appendWgfAuditEntry, ensureWgfAuditBootstrap } from '../lib/wgfAuditLog.js';
 
 function patternDirectionFromSnapshot(snap) {
   if (!snap) return null;
@@ -54,7 +67,9 @@ const TradingSessionContext = createContext(null);
 
 export function TradingProvider({ children }) {
   const [booting, setBooting] = useState(true);
+  const [bootError, setBootError] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [showWgfPurchasedWizard, setShowWgfPurchasedWizard] = useState(false);
   const [settings, setSettings] = useState(null);
   const [challenge, setChallenge] = useState(null);
   const [trades, setTrades] = useState([]);
@@ -146,16 +161,27 @@ export function TradingProvider({ children }) {
   }, [setImportedSeries]);
 
   const refreshChallenge = useCallback(async () => {
-    const settingsRow = await fetchAppSettings();
-    await ensureActiveChallenge(settingsRow);
-    const row = await fetchActiveChallenge();
-    if (row) {
-      const synced = await refreshEquityState(row);
-      setChallenge(synced ?? row);
-      return synced ?? row;
+    try {
+      const settingsRow = await fetchAppSettings();
+      if (window.nexaTrader?.db?.status) {
+        await window.nexaTrader.db.status();
+      }
+      await ensureActiveChallenge(settingsRow);
+      const row = await fetchActiveChallenge();
+      if (row) {
+        const synced = await refreshEquityState(row);
+        const next = synced ?? row;
+        await ensureWgfAuditBootstrap(next);
+        setChallenge(next);
+        return next;
+      }
+      setChallenge(null);
+      return null;
+    } catch (err) {
+      console.error('[NexaTrader] refreshChallenge:', err);
+      setChallenge(null);
+      return null;
     }
-    setChallenge(null);
-    return null;
   }, []);
 
   const refreshTrades = useCallback(async () => {
@@ -165,29 +191,39 @@ export function TradingProvider({ children }) {
 
   const reloadApp = useCallback(async () => {
     let dbConnected = false;
-    if (window.nexaTrader?.db?.status) {
-      const statusRes = await window.nexaTrader.db.status();
-      dbConnected = statusRes?.ok !== false && statusRes?.data?.ready === true;
-    } else if (window.nexaTrader?.db) {
-      dbConnected = true;
-    }
-
-    const appSettings = await fetchAppSettings();
-    setSettings(appSettings);
-    setDbStatus(
-      dbConnected && !appSettings._offline ? 'connected' : 'offline',
-    );
-    setShowOnboarding(Number(appSettings.first_launch_completed) !== 1);
-    await refreshChallenge();
-    await refreshTrades();
     try {
-      const savedCoach = await loadCoachHistory();
-      if (savedCoach.length) {
-        coachMessagesRef.current = savedCoach;
-        setCoachMessages(savedCoach);
+      if (window.nexaTrader?.db?.status) {
+        const statusRes = await window.nexaTrader.db.status();
+        dbConnected = statusRes?.ok !== false && statusRes?.data?.ready === true;
+      } else if (window.nexaTrader?.db) {
+        dbConnected = true;
       }
-    } catch {
-      /* ignore */
+
+      const appSettings = await fetchAppSettings();
+      setSettings(appSettings);
+      setDbStatus(
+        dbConnected && !appSettings._offline ? 'connected' : 'offline',
+      );
+      setShowOnboarding(Number(appSettings.first_launch_completed) !== 1);
+      await refreshChallenge();
+      await refreshTrades();
+      try {
+        await refreshEconomicCalendarFromSettings(appSettings);
+      } catch {
+        /* ignore calendar */
+      }
+      try {
+        const savedCoach = await loadCoachHistory();
+        if (savedCoach.length) {
+          coachMessagesRef.current = savedCoach;
+          setCoachMessages(savedCoach);
+        }
+      } catch {
+        /* ignore */
+      }
+    } catch (err) {
+      console.error('[NexaTrader] reloadApp:', err);
+      throw err;
     }
   }, [refreshChallenge, refreshTrades]);
 
@@ -195,50 +231,56 @@ export function TradingProvider({ children }) {
     let cancelled = false;
 
     async function boot() {
-      await reloadApp();
-      if (cancelled) return;
-
       try {
-        const worker = new WickWorker();
-        workerRef.current = worker;
+        await reloadApp();
+        if (cancelled) return;
 
-        worker.onmessage = (event) => {
-          const data = event.data ?? {};
-          if (data.type === 'PONG') {
-            setWorkerStatus('ready');
-            return;
-          }
+        try {
+          const worker = new WickWorker();
+          workerRef.current = worker;
 
-          if (data.type === 'ANALYZE_CANDLES_RESULT') {
-            const pending = analyzePendingRef.current.get(data.requestId);
-            if (pending) {
-              analyzePendingRef.current.delete(data.requestId);
-              if (data.ok) pending.resolve(data.result);
-              else pending.reject(new Error(data.error ?? 'Analyse échouée'));
+          worker.onmessage = (event) => {
+            const data = event.data ?? {};
+            if (data.type === 'PONG') {
+              setWorkerStatus('ready');
+              return;
             }
 
-            if (data.ok && data.result?.latestSignal) {
-              setLatestChartSignal(data.result.latestSignal);
-            }
-            return;
-          }
+            if (data.type === 'ANALYZE_CANDLES_RESULT') {
+              const pending = analyzePendingRef.current.get(data.requestId);
+              if (pending) {
+                analyzePendingRef.current.delete(data.requestId);
+                if (data.ok) pending.resolve(data.result);
+                else pending.reject(new Error(data.error ?? 'Analyse échouée'));
+              }
 
-          if (data.type === 'ERROR') {
-            const pending = analyzePendingRef.current.get(data.requestId);
-            if (pending) {
-              analyzePendingRef.current.delete(data.requestId);
-              pending.reject(new Error(data.error ?? 'Erreur worker'));
+              if (data.ok && data.result?.latestSignal) {
+                setLatestChartSignal(data.result.latestSignal);
+              }
+              return;
             }
-          }
-        };
 
-        worker.onerror = () => setWorkerStatus('error');
-        worker.postMessage({ type: 'PING', requestId: 'boot' });
-      } catch {
-        setWorkerStatus('error');
+            if (data.type === 'ERROR') {
+              const pending = analyzePendingRef.current.get(data.requestId);
+              if (pending) {
+                analyzePendingRef.current.delete(data.requestId);
+                pending.reject(new Error(data.error ?? 'Erreur worker'));
+              }
+            }
+          };
+
+          worker.onerror = () => setWorkerStatus('error');
+          worker.postMessage({ type: 'PING', requestId: 'boot' });
+        } catch {
+          setWorkerStatus('error');
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setBootError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (!cancelled) setBooting(false);
       }
-
-      setBooting(false);
     }
 
     boot();
@@ -373,8 +415,9 @@ export function TradingProvider({ children }) {
         killSwitchActive,
         paperTrading:
           settings?.paper_trading == null || Number(settings?.paper_trading) === 1,
+        wgfEnforcementMode: resolveWgfEnforcementMode(settings),
       }),
-    [symbol, currentSpread, challenge, inSession, killSwitchActive, settings?.paper_trading],
+    [symbol, currentSpread, challenge, inSession, killSwitchActive, settings],
   );
 
   const registerChartControls = useCallback((api) => {
@@ -631,22 +674,44 @@ export function TradingProvider({ children }) {
          WHERE status = 'active'`,
       );
 
-      await db.run(
+      const programId = payload.wgfProgramId ?? DEFAULT_WGF_PROGRAM_ID;
+      const program = getWgfProgram(programId);
+      const limits = limitsForProgram(programId);
+
+      const track = buildChallengeTrackingFields(programId, payload.initialBalance);
+
+      const insertResult = await db.run(
         `INSERT INTO local_challenge (
           status, initial_balance, current_equity, starting_daily_balance,
           profit_target_percent, max_daily_loss_percent, max_overall_loss_percent,
+          wgf_program_id, wgf_phase, last_daily_reset_gmt,
+          last_eod_process_gmt, last_equity_snapshot, eod_trailing_floor,
           consecutive_losses, failure_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)`,
         [
           'active',
           payload.initialBalance,
           payload.initialBalance,
           payload.initialBalance,
-          payload.profitTargetPercent,
-          payload.maxDailyLossPercent,
-          payload.maxOverallLossPercent,
+          payload.profitTargetPercent ?? limits.profit_target_percent,
+          payload.maxDailyLossPercent ?? limits.max_daily_loss_percent,
+          payload.maxOverallLossPercent ?? limits.max_overall_loss_percent,
+          program.id,
+          program.phase ?? 1,
+          track.last_daily_reset_gmt,
+          track.last_eod_process_gmt,
+          track.last_equity_snapshot,
+          track.eod_trailing_floor,
         ],
       );
+
+      await appendWgfAuditEntry({
+        challengeId: insertResult.lastInsertRowid,
+        eventType: 'challenge_new',
+        title: 'Onboarding — challenge créé',
+        detail: `${program.shortLabel} · capital ${Number(payload.initialBalance).toLocaleString('fr-FR')} $`,
+        equity: payload.initialBalance,
+      });
 
       setShowOnboarding(false);
       await reloadApp();
@@ -680,6 +745,8 @@ export function TradingProvider({ children }) {
             : settings?.google_oauth_client_id,
         paper_trading:
           partial.paperTrading != null ? (partial.paperTrading ? 1 : 0) : settings?.paper_trading,
+        wgf_enforcement_mode:
+          partial.wgfEnforcementMode ?? resolveWgfEnforcementMode(settings),
         market_provider:
           partial.marketProvider !== undefined
             ? partial.marketProvider
@@ -688,6 +755,24 @@ export function TradingProvider({ children }) {
           partial.marketApiKey !== undefined
             ? partial.marketApiKey
             : settings?.market_api_key ?? '',
+        guardian_mode:
+          partial.guardianMode != null
+            ? partial.guardianMode
+              ? 1
+              : 0
+            : settings?.guardian_mode ?? 0,
+        local_social_enabled:
+          partial.localSocialEnabled != null
+            ? partial.localSocialEnabled
+              ? 1
+              : 0
+            : settings?.local_social_enabled ?? 0,
+        wgf_purchased_wizard_done:
+          partial.wgfPurchasedWizardDone != null
+            ? partial.wgfPurchasedWizardDone
+              ? 1
+              : 0
+            : settings?.wgf_purchased_wizard_done ?? 0,
       };
 
       const result = await db.run(
@@ -699,8 +784,12 @@ export function TradingProvider({ children }) {
           auto_pilot = ?,
           google_oauth_client_id = ?,
           paper_trading = ?,
+          wgf_enforcement_mode = ?,
           market_provider = ?,
-          market_api_key = ?
+          market_api_key = ?,
+          guardian_mode = ?,
+          local_social_enabled = ?,
+          wgf_purchased_wizard_done = ?
          WHERE id = 1`,
         [
           next.ai_provider,
@@ -710,8 +799,12 @@ export function TradingProvider({ children }) {
           next.auto_pilot ?? 0,
           next.google_oauth_client_id ?? '',
           next.paper_trading ?? 1,
+          next.wgf_enforcement_mode ?? resolveWgfEnforcementMode(settings),
           next.market_provider ?? 'simulated',
           next.market_api_key ?? '',
+          next.guardian_mode ?? 0,
+          next.local_social_enabled ?? 0,
+          next.wgf_purchased_wizard_done ?? 0,
         ],
       );
       assertDbWriteOk(result, 'Enregistrement des paramètres');
@@ -730,9 +823,48 @@ export function TradingProvider({ children }) {
     [refreshChallenge],
   );
 
+  const applyWgfProgram = useCallback(
+    async (programId) => {
+      await applyWgfProgramToActiveChallenge(programId);
+      await refreshChallenge();
+    },
+    [refreshChallenge],
+  );
+
+  const setOneDayPass = useCallback(
+    async (enabled) => {
+      await setOneDayPassOnActiveChallenge(enabled);
+      await refreshChallenge();
+    },
+    [refreshChallenge],
+  );
+
+  const advanceWgfPhase = useCallback(async () => {
+    await advanceWgfPhaseAfterPass();
+    await refreshChallenge();
+  }, [refreshChallenge]);
+
   const resetChallenge = useCallback(
     async (payload) => {
       await resetChallengeWithCapital(payload);
+      await refreshChallenge();
+      await refreshTrades();
+    },
+    [refreshChallenge, refreshTrades],
+  );
+
+  const completeWgfPurchasedWizard = useCallback(
+    async ({ initialBalance, programId }) => {
+      await resetChallengeWithCapital({
+        initialBalance,
+        programId,
+      });
+      await applyWgfProgramToActiveChallenge(programId);
+      await updateSettingsRef.current?.({
+        wgfEnforcementMode: 'official',
+        wgfPurchasedWizardDone: true,
+      });
+      setShowWgfPurchasedWizard(false);
       await refreshChallenge();
       await refreshTrades();
     },
@@ -756,6 +888,9 @@ export function TradingProvider({ children }) {
         currentSpread,
         inSession,
         killSwitchActive,
+        planSnapshot: orderOverrides.planSnapshot
+          ? serializePlanSnapshot(orderOverrides.planSnapshot)
+          : null,
       });
 
       if (!result.ok) {
@@ -845,6 +980,7 @@ export function TradingProvider({ children }) {
     const result = await placeOrder(side, {
       entry: snap.entry,
       stopLoss: snap.stopLoss,
+      planSnapshot: snap,
     });
     if (result?.ok) {
       setPendingPreTradeSide(null);
@@ -1038,6 +1174,10 @@ export function TradingProvider({ children }) {
     () => ({
       booting,
       showOnboarding,
+      showWgfPurchasedWizard,
+      setShowWgfPurchasedWizard,
+      completeWgfPurchasedWizard,
+      guardianMode: Number(settings?.guardian_mode) === 1,
       settings,
       challenge,
       trades,
@@ -1051,6 +1191,9 @@ export function TradingProvider({ children }) {
       completeOnboarding,
       updateSettings,
       updateChallengeSettings,
+      applyWgfProgram,
+      setOneDayPass,
+      advanceWgfPhase,
       resetChallenge,
       placeOrder,
       requestPlaceOrder,
@@ -1070,6 +1213,7 @@ export function TradingProvider({ children }) {
       executeKillSwitch,
       resumeKillSwitch,
       killSwitchActive,
+      bootError,
       reloadApp,
       analyzeCandles,
       latestChartSignal,
@@ -1097,6 +1241,8 @@ export function TradingProvider({ children }) {
     [
       booting,
       showOnboarding,
+      showWgfPurchasedWizard,
+      completeWgfPurchasedWizard,
       settings,
       challenge,
       trades,
@@ -1108,6 +1254,9 @@ export function TradingProvider({ children }) {
       completeOnboarding,
       updateSettings,
       updateChallengeSettings,
+      applyWgfProgram,
+      setOneDayPass,
+      advanceWgfPhase,
       resetChallenge,
       placeOrder,
       requestPlaceOrder,
@@ -1127,6 +1276,7 @@ export function TradingProvider({ children }) {
       executeKillSwitch,
       resumeKillSwitch,
       killSwitchActive,
+      bootError,
       reloadApp,
       analyzeCandles,
       latestChartSignal,

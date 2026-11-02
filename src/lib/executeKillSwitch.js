@@ -2,6 +2,7 @@ import { getDb } from './db.js';
 import { estimatePnl } from '../engine/positionSizer.js';
 import { syncChallengeEquity } from './challengeEquity.js';
 import { recordPatternOutcome } from './patternMemory.js';
+import { appendWgfAuditEntry } from './wgfAuditLog.js';
 
 /**
  * Kill Switch global — clôture d'urgence 100 % des ordres ouverts.
@@ -73,6 +74,13 @@ export async function executeKillSwitch({
        WHERE id = ?`,
       [reason, challenge.id],
     );
+    await appendWgfAuditEntry({
+      challengeId: challenge.id,
+      eventType: 'kill_switch',
+      title: 'Kill Switch activé',
+      detail: `${reason} · ${openTrades.length} position(s) clôturée(s)`,
+      equity: challenge.current_equity,
+    });
     await syncChallengeEquity({ ...challenge, status: 'paused' });
   }
 

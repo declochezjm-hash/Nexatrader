@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { LineChart, Pencil, Trash2, X } from 'lucide-react';
 import { useTradingSession } from '../context/TradingContext.jsx';
 import { compareTradeDecision } from '../lib/tradeDecisionCompare.js';
+import TwinTradePanel from './TwinTradePanel.jsx';
 import {
   deleteTradeRecord,
   fetchTradeDetail,
@@ -304,6 +305,8 @@ export default function TradeRecordModal({ tradeId, startInEdit = false, onClose
                 </p>
               </div>
             )}
+
+            {detail ? <TwinTradePanel trade={detail} /> : null}
 
             {error && <p className="text-[11px] text-rose-300">{error}</p>}
             <div className="flex flex-wrap gap-2 border-t border-slate-800 pt-3">

@@ -53,7 +53,7 @@ export default function TipsBanner() {
         onClick={() => setTutorialOpen(true)}
         className="mt-2 mr-2 text-[11px] font-medium text-sky-400 hover:text-sky-300"
       >
-        Tutoriel complet →
+        Hub WGF →
       </button>
       <button
         type="button"

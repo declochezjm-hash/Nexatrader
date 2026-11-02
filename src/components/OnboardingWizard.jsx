@@ -9,7 +9,8 @@ import {
   Zap,
 } from 'lucide-react';
 import { DEFAULT_GEMINI_SETTINGS_ID } from '../lib/geminiModels.js';
-import { WGF_READY_DEFAULTS } from '../lib/db.js';
+import { DEFAULT_WGF_PROGRAM_ID, limitsForProgram } from '../lib/wgfPrograms.js';
+import WgfProgramPanel from './WgfProgramPanel.jsx';
 import {
   getElectronEnvironmentHint,
   isElectronBridgeAvailable,
@@ -69,6 +70,7 @@ export default function OnboardingWizard({ onComplete }) {
   const [showOAuthAdvanced, setShowOAuthAdvanced] = useState(false);
   const [electronReady, setElectronReady] = useState(isElectronBridgeAvailable());
   const [capital, setCapital] = useState('100000');
+  const [wgfProgramId, setWgfProgramId] = useState(DEFAULT_WGF_PROGRAM_ID);
   const [riskPercent, setRiskPercent] = useState('1');
   const [indicators, setIndicators] = useState(['wicks', 'propguard', 'ai']);
   const [saving, setSaving] = useState(false);
@@ -169,7 +171,7 @@ export default function OnboardingWizard({ onComplete }) {
       if (googleClientId.trim()) {
         await persistGoogleClientId();
       }
-      const wgf = WGF_READY_DEFAULTS;
+      const limits = limitsForProgram(wgfProgramId);
       await onComplete({
         isQuickSetup: profile === 'ready',
         aiProvider,
@@ -180,9 +182,10 @@ export default function OnboardingWizard({ onComplete }) {
           ? ['wicks', 'propguard', 'ai']
           : indicators
         ).join(','),
-        profitTargetPercent: wgf.profit_target_percent,
-        maxDailyLossPercent: wgf.max_daily_loss_percent,
-        maxOverallLossPercent: wgf.max_overall_loss_percent,
+        wgfProgramId,
+        profitTargetPercent: limits.profit_target_percent,
+        maxDailyLossPercent: limits.max_daily_loss_percent,
+        maxOverallLossPercent: limits.max_overall_loss_percent,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Échec de l’enregistrement.');
@@ -233,7 +236,7 @@ export default function OnboardingWizard({ onComplete }) {
             </div>
             <p className="rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs text-sky-200/90">
               Après le lancement, un tutoriel pas à pas et des conseils trading seront disponibles
-              via le bouton <strong className="font-medium">Tutoriel</strong> en haut de l’écran.
+              via le bouton <strong className="font-medium">Hub WGF</strong> en haut de l’écran.
             </p>
             </div>
           )}
@@ -395,10 +398,7 @@ export default function OnboardingWizard({ onComplete }) {
                   className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100"
                 />
               </label>
-              <p className="rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2 text-xs text-slate-500">
-                Limites WGF : perte journalière max {WGF_READY_DEFAULTS.max_daily_loss_percent} %,
-                drawdown total max {WGF_READY_DEFAULTS.max_overall_loss_percent} %.
-              </p>
+              <WgfProgramPanel programId={wgfProgramId} onProgramChange={setWgfProgramId} compact />
             </div>
           )}
 

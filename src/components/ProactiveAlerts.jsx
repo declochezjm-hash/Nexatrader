@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, X } from 'lucide-react';
 import { useTradingSession } from '../context/TradingContext.jsx';
+import { collectIntelligentAlerts } from '../lib/intelligentAlerts.js';
 
 const DISMISS_MS = 12000;
 
@@ -33,7 +34,7 @@ function AlertToast({ alert, onDismiss }) {
 }
 
 function ProactiveAlertsInner() {
-  const { propGuard, proactiveAlertsEnabled } = useTradingSession();
+  const { propGuard, proactiveAlertsEnabled, challenge, trades } = useTradingSession();
   const [visible, setVisible] = useState([]);
   const seenRef = useRef(new Set());
 
@@ -85,10 +86,16 @@ function ProactiveAlertsInner() {
       }
     }
 
+    for (const wgf of collectIntelligentAlerts({ challenge, trades, propGuard })) {
+      if (seenRef.current.has(wgf.id)) continue;
+      seenRef.current.add(wgf.id);
+      next.push(wgf);
+    }
+
     if (next.length) {
       setVisible((prev) => [...prev, ...next].slice(-4));
     }
-  }, [propGuard, proactiveAlertsEnabled]);
+  }, [propGuard, proactiveAlertsEnabled, challenge, trades]);
 
   useEffect(() => {
     if (!visible.length) return undefined;

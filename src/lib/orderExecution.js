@@ -1,5 +1,6 @@
 import { getDb } from './db.js';
 import { canOpenTrade } from '../engine/propGuard.js';
+import { resolveWgfEnforcementMode } from './wgfEnforcement.js';
 import { calculateLotSize } from '../engine/positionSizer.js';
 import { syncChallengeEquity } from './challengeEquity.js';
 import { validateStopLossForSide } from './preTradeValidation.js';
@@ -18,6 +19,7 @@ export async function executeOpenOrder({
   currentSpread,
   inSession,
   killSwitchActive,
+  planSnapshot = null,
 }) {
   const gate = canOpenTrade({
     symbol,
@@ -27,6 +29,7 @@ export async function executeOpenOrder({
     killSwitchActive,
     paperTrading:
       settings?.paper_trading == null || Number(settings?.paper_trading) === 1,
+    wgfEnforcementMode: resolveWgfEnforcementMode(settings),
   });
 
   if (!gate.allowed) {
@@ -65,8 +68,8 @@ export async function executeOpenOrder({
 
   const result = await db.run(
     `INSERT INTO trades (
-      symbol, type, lot_size, risk_percent, entry_price, stop_loss, take_profit, pnl, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'open')`,
+      symbol, type, lot_size, risk_percent, entry_price, stop_loss, take_profit, pnl, status, plan_snapshot
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'open', ?)`,
     [
       symbol,
       side,
@@ -75,6 +78,7 @@ export async function executeOpenOrder({
       entry,
       sl,
       takeProfitPrice ?? null,
+      planSnapshot,
     ],
   );
 

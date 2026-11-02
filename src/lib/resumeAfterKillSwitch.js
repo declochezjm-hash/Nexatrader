@@ -1,5 +1,6 @@
 import { getDb } from './db.js';
 import { syncChallengeEquity } from './challengeEquity.js';
+import { appendWgfAuditEntry } from './wgfAuditLog.js';
 
 /**
  * Relance le challenge après Kill Switch (ou pause sécurisée).
@@ -35,6 +36,14 @@ export async function resumeAfterKillSwitch() {
     status: 'active',
     failure_reason: null,
     anti_tilt_until: null,
+  });
+
+  await appendWgfAuditEntry({
+    challengeId: row.id,
+    eventType: 'resume',
+    title: 'Reprise après pause',
+    detail: 'Challenge actif · anti-tilt levé',
+    equity: synced?.current_equity ?? row.current_equity,
   });
 
   return synced ?? { ...row, status: 'active' };

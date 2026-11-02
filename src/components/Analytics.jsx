@@ -15,6 +15,7 @@ import {
   sortDrillTrades,
 } from '../lib/analyticsDrill.js';
 import TradeRecordModal from './TradeRecordModal.jsx';
+import DisciplineHeatmap from './DisciplineHeatmap.jsx';
 
 function MetricCard({ label, value, sub, tone = 'default', active, onClick }) {
   const valueClass =
@@ -169,6 +170,7 @@ export default function Analytics({ onClose }) {
           )}
           {metrics && (
             <div className={`space-y-3 ${refreshing ? 'opacity-85' : ''}`}>
+              <DisciplineHeatmap trades={metrics.trades ?? trades} />
               <div className="grid grid-cols-2 gap-2 md:grid-cols-4 lg:grid-cols-6">
                 <MetricCard
                   label="Win rate global"

@@ -14,6 +14,7 @@ import {
 import { callGeminiGenerateContent, hasGeminiApiKeyInEnv } from './geminiBridge.js';
 import { loginWithGoogle, refreshGoogleAccessTokenIfNeeded, isGoogleOAuthConfigured } from './googleAuth.js';
 import { fetchLiveCandles, testMarketConnection } from './marketDataBridge.js';
+import { fetchFinnhubEconomicCalendar } from './economicCalendarBridge.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -180,6 +181,21 @@ function registerMarketIpc() {
   });
 }
 
+function registerCalendarIpc() {
+  ipcMain.handle('calendar:fetch', async (_event, payload) => {
+    try {
+      const { apiKey, from, to } = payload ?? {};
+      const result = await fetchFinnhubEconomicCalendar(apiKey, from, to);
+      return result;
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+}
+
 function registerAiIpc() {
   ipcMain.handle('ai:geminiEnvStatus', () => ({
     ok: true,
@@ -272,6 +288,7 @@ app.whenReady().then(() => {
   registerAuthIpc();
   registerAiIpc();
   registerMarketIpc();
+  registerCalendarIpc();
   createMainWindow();
 
   app.on('activate', () => {

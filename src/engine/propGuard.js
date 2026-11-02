@@ -1,5 +1,17 @@
 import { isNearNews } from './newsFilter.js';
 import { isUsCashSession } from './nasdaqAnalyzer.js';
+import {
+  resolveDailyLossLimitPercent,
+  resolveOverallLossLimitPercent,
+} from '../lib/wgfPrograms.js';
+import {
+  challengeUsesEodTrailing,
+  computeEodDrawdownMetrics,
+  evaluateEodIntradayFail,
+  resolveEodTrailingFloor,
+} from '../lib/wgfEodTrailing.js';
+import { computeProfitProgress, resolveProfitTargetPercent } from '../lib/wgfProfitTarget.js';
+import { isWgfOfficialEnforcement } from '../lib/wgfEnforcement.js';
 
 export const SPREAD_LIMITS = {
   XAUUSD: 0.4,
@@ -17,6 +29,18 @@ export function computeDrawdowns(challenge) {
   const dailyStart = challenge.starting_daily_balance || challenge.initial_balance || 1;
   const initial = challenge.initial_balance || 1;
   const equity = challenge.current_equity ?? initial;
+
+  if (challengeUsesEodTrailing(challenge)) {
+    const eod = computeEodDrawdownMetrics(challenge, equity);
+    const usedPct = Math.max(0, ((initial - equity) / initial) * 100);
+    return {
+      dailyDrawdownPct: 0,
+      overallDrawdownPct: Number(usedPct.toFixed(2)),
+      eodFloor: eod.eodFloor,
+      eodMarginPct: eod.marginPctOfInitial,
+      eodLocked: eod.lockedAtInitial,
+    };
+  }
 
   const dailyDrawdownPct = Math.max(0, ((dailyStart - equity) / dailyStart) * 100);
   const overallDrawdownPct = Math.max(0, ((initial - equity) / initial) * 100);
@@ -47,6 +71,7 @@ export function antiTiltRemainingMinutes(challenge, nowMs = Date.now()) {
  *   inSession?: boolean,
  *   killSwitchActive?: boolean,
  *   paperTrading?: boolean,
+ *   wgfEnforcementMode?: 'official' | 'conservative',
  *   now?: Date,
  * }} ctx
  */
@@ -57,14 +82,18 @@ export function canOpenTrade({
   inSession = true,
   killSwitchActive = false,
   paperTrading = false,
+  wgfEnforcementMode = 'conservative',
   now = new Date(),
 }) {
   const reasons = [];
   const badges = [];
+  const wgfOfficial = isWgfOfficialEnforcement(wgfEnforcementMode);
   const spreadLimit = SPREAD_LIMITS[symbol] ?? SPREAD_LIMITS.XAUUSD;
   const { dailyDrawdownPct, overallDrawdownPct } = computeDrawdowns(challenge);
-  const maxDaily = challenge?.max_daily_loss_percent ?? 5;
-  const maxOverall = challenge?.max_overall_loss_percent ?? 10;
+  const profitProgress = computeProfitProgress(challenge);
+  const profitTargetPct = resolveProfitTargetPercent(challenge);
+  const maxDaily = resolveDailyLossLimitPercent(challenge);
+  const maxOverall = resolveOverallLossLimitPercent(challenge);
   const nowMs = now.getTime();
 
   if (killSwitchActive) {
@@ -89,9 +118,14 @@ export function canOpenTrade({
     badges.push({ id: 'failed', label: 'Challenge FAILED', tone: 'rose' });
   }
 
+  if (challenge?.status === 'passed') {
+    reasons.push('Objectif de profit WGF atteint — passez à la phase suivante');
+    badges.push({ id: 'passed', label: 'Phase validée', tone: 'emerald' });
+  }
+
   if (currentSpread > spreadLimit) {
-    if (paperTrading) {
-      badges.push({ id: 'spread', label: 'Spread élevé (paper OK)', tone: 'amber' });
+    if (wgfOfficial) {
+      badges.push({ id: 'spread', label: 'Spread élevé (WGF OK)', tone: 'amber' });
     } else {
       reasons.push(`Spread trop élevé (${currentSpread.toFixed(2)} / max ${spreadLimit})`);
       badges.push({ id: 'spread', label: 'Spread trop fort', tone: 'amber' });
@@ -99,8 +133,8 @@ export function canOpenTrade({
   }
 
   if (symbol === 'NAS100' && !inSession) {
-    if (paperTrading) {
-      badges.push({ id: 'session', label: 'Hors session (paper OK)', tone: 'amber' });
+    if (wgfOfficial) {
+      badges.push({ id: 'session', label: 'Hors session (WGF OK)', tone: 'amber' });
     } else {
       reasons.push('NAS100 hors session US (cash)');
       badges.push({ id: 'session', label: 'Hors session US', tone: 'amber' });
@@ -115,19 +149,27 @@ export function canOpenTrade({
 
   const news = isNearNews(symbol, 15, now);
   if (news.near) {
-    if (paperTrading) {
-      badges.push({ id: 'news', label: 'Annonce proche (paper OK)', tone: 'amber' });
+    if (wgfOfficial) {
+      badges.push({ id: 'news', label: 'Annonce proche (WGF OK)', tone: 'amber' });
     } else {
       reasons.push(`Annonce imminente : ${news.event.label}`);
       badges.push({ id: 'news', label: 'Annonce économique', tone: 'rose' });
     }
   }
 
-  if (dailyDrawdownPct >= maxDaily) {
+  if (maxDaily != null && dailyDrawdownPct >= maxDaily) {
     reasons.push(`Drawdown journalier WGF (${dailyDrawdownPct}% ≥ ${maxDaily}%)`);
   }
 
-  if (overallDrawdownPct >= maxOverall) {
+  if (challengeUsesEodTrailing(challenge)) {
+    const floor = resolveEodTrailingFloor(challenge);
+    const equity = challenge.current_equity ?? challenge.initial_balance ?? 0;
+    if (Number(equity) < floor - 0.001) {
+      reasons.push(
+        `Plancher EOD WGF (${Number(equity).toFixed(0)} $ < plancher ${floor.toFixed(0)} $)`,
+      );
+    }
+  } else if (overallDrawdownPct >= maxOverall) {
     reasons.push(`Drawdown global WGF (${overallDrawdownPct}% ≥ ${maxOverall}%)`);
   }
 
@@ -139,6 +181,15 @@ export function canOpenTrade({
     overallDrawdownPct,
     maxDaily,
     maxOverall,
+    eodFloor: challengeUsesEodTrailing(challenge)
+      ? resolveEodTrailingFloor(challenge)
+      : null,
+    profitPct: profitProgress.profitPct,
+    profitTargetPct,
+    profitRemainingPct: profitProgress.remainingPct,
+    profitTargetReached: profitProgress.reached,
+    wgfEnforcementMode,
+    wgfOfficial,
     spreadLimit,
     currentSpread,
     news,
@@ -187,17 +238,22 @@ export function computeEquityFromTrades(challenge, trades) {
  */
 export function shouldFailChallenge(challenge, equity) {
   if (!challenge) return { fail: false };
+
+  if (challengeUsesEodTrailing(challenge)) {
+    return evaluateEodIntradayFail(challenge, equity);
+  }
+
   const initial = challenge.initial_balance || 1;
   const dailyStart = challenge.starting_daily_balance || initial;
   const dailyDd = Math.max(0, ((dailyStart - equity) / dailyStart) * 100);
   const overallDd = Math.max(0, ((initial - equity) / initial) * 100);
-  const maxDaily = challenge.max_daily_loss_percent ?? 5;
-  const maxOverall = challenge.max_overall_loss_percent ?? 10;
+  const maxDaily = resolveDailyLossLimitPercent(challenge);
+  const maxOverall = resolveOverallLossLimitPercent(challenge);
 
   if (overallDd >= maxOverall) {
     return { fail: true, reason: `Drawdown global ${overallDd.toFixed(2)}% (max ${maxOverall}%)` };
   }
-  if (dailyDd >= maxDaily) {
+  if (maxDaily != null && dailyDd >= maxDaily) {
     return { fail: true, reason: `Drawdown journalier ${dailyDd.toFixed(2)}% (max ${maxDaily}%)` };
   }
   return { fail: false };

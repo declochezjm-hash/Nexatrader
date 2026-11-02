@@ -14,6 +14,7 @@ const ALLOWED_INVOKE_CHANNELS = new Set([
   'auth:googleOAuthConfigured',
   'market:fetchCandles',
   'market:testConnection',
+  'calendar:fetch',
   'ai:geminiEnvStatus',
 ]);
 
@@ -111,5 +112,9 @@ contextBridge.exposeInMainWorld('nexaTrader', {
   market: {
     fetchCandles: (payload) => invokeSafe('market:fetchCandles', payload),
     testConnection: (payload) => invokeSafe('market:testConnection', payload),
+  },
+
+  calendar: {
+    fetch: (payload) => invokeSafe('calendar:fetch', payload),
   },
 });

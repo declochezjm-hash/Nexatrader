@@ -1,4 +1,5 @@
 import { DEFAULT_GEMINI_SETTINGS_ID } from './geminiModels.js';
+import { DEFAULT_WGF_PROGRAM_ID, limitsForProgram } from './wgfPrograms.js';
 
 const DEFAULT_SETTINGS = {
   id: 1,
@@ -10,6 +11,7 @@ const DEFAULT_SETTINGS = {
   enabled_indicators: 'wicks,propguard,ai',
   auto_pilot: 0,
   paper_trading: 1,
+  wgf_enforcement_mode: null,
 };
 
 export function getDb() {
@@ -43,7 +45,7 @@ export async function fetchActiveChallenge() {
   }
   return db.get(
     `SELECT * FROM local_challenge
-     WHERE status IN ('active', 'paused')
+     WHERE status IN ('active', 'paused', 'passed')
      ORDER BY id DESC
      LIMIT 1`,
   );
@@ -63,8 +65,15 @@ export async function fetchRecentTrades(limit = 50) {
   );
 }
 
-export const WGF_READY_DEFAULTS = {
-  profit_target_percent: 8,
-  max_daily_loss_percent: 5,
-  max_overall_loss_percent: 10,
-};
+export async function fetchAllTradesForExport() {
+  const db = getDb();
+  if (!db) return [];
+  return db.query(
+    `SELECT id, symbol, type, lot_size, risk_percent, pnl, status, created_at
+     FROM trades
+     ORDER BY id ASC`,
+  );
+}
+
+/** @deprecated Utiliser limitsForProgram depuis wgfPrograms.js */
+export const WGF_READY_DEFAULTS = limitsForProgram(DEFAULT_WGF_PROGRAM_ID);

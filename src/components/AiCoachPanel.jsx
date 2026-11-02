@@ -38,6 +38,7 @@ function AiCoachPanelInner() {
     coachBusy,
     sendCoachMessage,
     clearCoachChat,
+    guardianMode,
   } = useTrading();
   const [draft, setDraft] = useState('');
   const scrollRef = useRef(null);
@@ -64,11 +65,12 @@ function AiCoachPanelInner() {
   }
 
   if (!coachOpen) {
+    if (guardianMode) return null;
     return (
       <button
         type="button"
         onClick={() => setCoachOpen(true)}
-        className="fixed bottom-20 right-4 z-40 flex items-center gap-2 rounded-full border border-violet-500/40 bg-violet-600/20 px-4 py-2.5 text-sm font-medium text-violet-100 shadow-lg shadow-violet-950/40 backdrop-blur hover:border-violet-400/60 hover:bg-violet-600/30"
+        className="guardian-hide fixed bottom-20 right-4 z-40 flex items-center gap-2 rounded-full border border-violet-500/40 bg-violet-600/20 px-4 py-2.5 text-sm font-medium text-violet-100 shadow-lg shadow-violet-950/40 backdrop-blur hover:border-violet-400/60 hover:bg-violet-600/30"
         title="Coach IA — conseils trading et aide app"
       >
         <MessageCircle className="h-5 w-5" />

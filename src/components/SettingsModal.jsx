@@ -9,6 +9,13 @@ import { loginWithGoogleIpc, waitForElectronBridge, getElectronEnvironmentHint }
 import { testMarketConnectionFromMain } from '../lib/marketDataClient.js';
 import { DEFAULT_GEMINI_SETTINGS_ID, normalizeGeminiSettingsId } from '../lib/geminiModels.js';
 import { WGF_READY_DEFAULTS } from '../lib/db.js';
+import { DEFAULT_WGF_PROGRAM_ID, limitsForProgram } from '../lib/wgfPrograms.js';
+import { ONE_DAY_PASS_PROGRAM_ID } from '../lib/wgfOneDayPass.js';
+import {
+  resolveWgfEnforcementMode,
+  WGF_ENFORCEMENT_OPTIONS,
+} from '../lib/wgfEnforcement.js';
+import WgfProgramPanel from './WgfProgramPanel.jsx';
 import {
   isDemoMarketProvider,
   isLiveMarketProvider,
@@ -42,13 +49,18 @@ export default function SettingsModal() {
     challenge,
     updateSettings,
     updateChallengeSettings,
+    applyWgfProgram,
+    setOneDayPass,
     resetChallenge,
+    setShowWgfPurchasedWizard,
     reloadApp,
   } = useTrading();
   const [aiProvider, setAiProvider] = useState(DEFAULT_GEMINI_SETTINGS_ID);
   const [riskPercent, setRiskPercent] = useState('1');
   const [autoPilot, setAutoPilot] = useState(false);
   const [paperTrading, setPaperTrading] = useState(true);
+  const [localSocialEnabled, setLocalSocialEnabled] = useState(false);
+  const [wgfEnforcementMode, setWgfEnforcementMode] = useState('conservative');
   const [saving, setSaving] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [googleEmail, setGoogleEmail] = useState('');
@@ -62,6 +74,9 @@ export default function SettingsModal() {
   const [maxOverall, setMaxOverall] = useState('10');
   const [challengeMsg, setChallengeMsg] = useState('');
   const [challengeBusy, setChallengeBusy] = useState(false);
+  const [oneDayPassBusy, setOneDayPassBusy] = useState(false);
+  const [wgfProgramId, setWgfProgramId] = useState(DEFAULT_WGF_PROGRAM_ID);
+  const [advancedLimits, setAdvancedLimits] = useState(false);
   const [marketProvider, setMarketProvider] = useState('twelve_data_demo');
   const [marketApiKey, setMarketApiKey] = useState('');
   const [testingMarket, setTestingMarket] = useState(false);
@@ -90,6 +105,8 @@ export default function SettingsModal() {
     setRiskPercent(String(settings.default_risk_percent ?? 1));
     setAutoPilot(Number(settings.auto_pilot) === 1);
     setPaperTrading(settings.paper_trading == null || Number(settings.paper_trading) === 1);
+    setLocalSocialEnabled(Number(settings.local_social_enabled) === 1);
+    setWgfEnforcementMode(resolveWgfEnforcementMode(settings));
     setGoogleEmail(settings.google_account_email ?? '');
     setGoogleClientId(settings.google_oauth_client_id ?? '');
     setMarketProvider(normalizeMarketProvider(settings.market_provider));
@@ -108,8 +125,42 @@ export default function SettingsModal() {
     setMaxOverall(
       String(challenge.max_overall_loss_percent ?? WGF_READY_DEFAULTS.max_overall_loss_percent),
     );
+    setWgfProgramId(challenge.wgf_program_id ?? DEFAULT_WGF_PROGRAM_ID);
     setChallengeMsg('');
   }, [settingsOpen, challenge]);
+
+  const oneDayPassEligible =
+    (challenge?.wgf_program_id ?? wgfProgramId) === ONE_DAY_PASS_PROGRAM_ID;
+  const oneDayPassActive = oneDayPassEligible && Number(challenge?.one_day_pass) === 1;
+
+  async function handleOneDayPassToggle(checked) {
+    setOneDayPassBusy(true);
+    setChallengeMsg('');
+    try {
+      await setOneDayPass(checked);
+      setChallengeMsg(
+        checked
+          ? 'One Day Pass activé : 1 jour minimum, consistency désactivée.'
+          : 'One Day Pass désactivé : règles 1 Step standard.',
+      );
+    } catch (err) {
+      setChallengeMsg(err instanceof Error ? err.message : 'Échec One Day Pass.');
+    } finally {
+      setOneDayPassBusy(false);
+    }
+  }
+
+  function syncLimitsFromProgram(programId) {
+    const lim = limitsForProgram(programId);
+    setProfitTarget(String(lim.profit_target_percent));
+    setMaxDaily(String(lim.max_daily_loss_percent));
+    setMaxOverall(String(lim.max_overall_loss_percent));
+  }
+
+  function handleWgfProgramChange(programId) {
+    setWgfProgramId(programId);
+    syncLimitsFromProgram(programId);
+  }
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -196,8 +247,10 @@ export default function SettingsModal() {
       autoPilot,
       googleOAuthClientId: googleClientId.trim(),
       paperTrading,
+      wgfEnforcementMode,
       marketProvider,
       marketApiKey: marketApiKey.trim() || settings?.market_api_key || '',
+      localSocialEnabled,
     };
   }
 
@@ -287,6 +340,19 @@ export default function SettingsModal() {
     }
   }
 
+  async function handleApplyWgfProgram() {
+    setChallengeBusy(true);
+    setChallengeMsg('');
+    try {
+      await applyWgfProgram(wgfProgramId);
+      setChallengeMsg(`Programme « ${wgfProgramId} » appliqué au challenge actif.`);
+    } catch (err) {
+      setChallengeMsg(err instanceof Error ? err.message : 'Échec application programme.');
+    } finally {
+      setChallengeBusy(false);
+    }
+  }
+
   async function handleSaveChallengeLimits(e) {
     e.preventDefault();
     setChallengeBusy(true);
@@ -318,6 +384,7 @@ export default function SettingsModal() {
     try {
       await resetChallenge({
         initialBalance: Number(challengeCapital),
+        programId: wgfProgramId,
         profitTargetPercent: Number(profitTarget),
         maxDailyLossPercent: Number(maxDaily),
         maxOverallLossPercent: Number(maxOverall),
@@ -462,8 +529,9 @@ export default function SettingsModal() {
               Challenge prop (WGF)
             </legend>
             <p className="text-[10px] leading-relaxed text-slate-500">
-              Règles type WGF : objectif de profit, plafond de perte journalière et drawdown total.
-              « Nouveau challenge » repart du capital saisi sans effacer le journal.
+              Choisissez le programme We Get Funded à simuler. Les limites numériques sont alignées
+              sur la FAQ WGF (objectif profit, phases, consistency et jours min. actifs). Le reset
+              journalier 00:00 GMT est actif pour les programmes avec perte jour (5 % / 3 %).
             </p>
             {challenge ? (
               <p className="text-[10px] text-slate-400">
@@ -475,6 +543,84 @@ export default function SettingsModal() {
             ) : (
               <p className="text-[10px] text-amber-300">Aucun challenge actif — créez-en un ci-dessous.</p>
             )}
+
+            <WgfProgramPanel
+              programId={wgfProgramId}
+              onProgramChange={handleWgfProgramChange}
+              showApplyHint
+            />
+
+            {oneDayPassEligible ? (
+              <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-violet-500/30 bg-violet-500/5 px-3 py-2 text-[11px] text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={oneDayPassActive}
+                  disabled={!challenge || oneDayPassBusy || challengeBusy}
+                  onChange={(e) => void handleOneDayPassToggle(e.target.checked)}
+                  className="mt-0.5 rounded border-slate-600"
+                />
+                <span>
+                  <span className="font-medium text-violet-200">One Day Pass (WGF 1 Step)</span>
+                  <span className="mt-0.5 block leading-snug text-slate-500">
+                    Option payante chez WGF : validation possible en 1 jour de trading actif, sans
+                    règle de consistency 50 %.
+                  </span>
+                </span>
+              </label>
+            ) : null}
+
+            <label className="flex items-center gap-2 text-[11px] text-slate-400">
+              <input
+                type="checkbox"
+                checked={localSocialEnabled}
+                onChange={(e) => setLocalSocialEnabled(e.target.checked)}
+                className="rounded border-slate-600"
+              />
+              Challenge social local (records personnels, sans réseau)
+            </label>
+
+            <button
+              type="button"
+              onClick={() => {
+                setSettingsOpen(false);
+                setShowWgfPurchasedWizard(true);
+              }}
+              className="w-full rounded-lg border border-emerald-600/40 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200 hover:border-emerald-500/60"
+            >
+              Parcours « J&apos;ai acheté WGF »
+            </button>
+
+            <p className="text-[10px] text-slate-500">
+              Calendrier économique réel : clé Finnhub + provider live → rechargé au démarrage
+              (sinon simulation NFP/CPI/FOMC).
+            </p>
+
+            <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+              <p className="text-[11px] font-medium text-slate-300">Mode PropGuard (étape 6)</p>
+              {WGF_ENFORCEMENT_OPTIONS.map((opt) => (
+                <label
+                  key={opt.id}
+                  className={`flex cursor-pointer gap-2 rounded-lg border px-3 py-2 text-[11px] ${
+                    wgfEnforcementMode === opt.id
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-slate-100'
+                      : 'border-slate-800 text-slate-400 hover:border-slate-600'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="wgfEnforcement"
+                    checked={wgfEnforcementMode === opt.id}
+                    onChange={() => setWgfEnforcementMode(opt.id)}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    <span className="font-medium text-slate-200">{opt.label}</span>
+                    <span className="mt-0.5 block leading-snug text-slate-500">{opt.description}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+
             <label className="block text-xs text-slate-400">
               Capital initial (USD)
               <input
@@ -486,6 +632,16 @@ export default function SettingsModal() {
                 className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100"
               />
             </label>
+            <label className="flex items-center gap-2 text-[11px] text-slate-400">
+              <input
+                type="checkbox"
+                checked={advancedLimits}
+                onChange={(e) => setAdvancedLimits(e.target.checked)}
+                className="rounded border-slate-600"
+              />
+              Personnaliser les limites (avancé)
+            </label>
+            {advancedLimits && (
             <div className="grid grid-cols-3 gap-2">
               <label className="block text-[10px] text-slate-400">
                 Objectif profit %
@@ -524,7 +680,19 @@ export default function SettingsModal() {
                 />
               </label>
             </div>
+            )}
             <div className="flex flex-wrap gap-2">
+              {challenge && (
+                <button
+                  type="button"
+                  disabled={challengeBusy}
+                  onClick={() => void handleApplyWgfProgram()}
+                  className="rounded-lg border border-emerald-500/50 bg-emerald-600/25 px-3 py-1.5 text-[11px] font-medium text-emerald-100 hover:bg-emerald-600/35 disabled:opacity-50"
+                >
+                  Appliquer le programme WGF
+                </button>
+              )}
+              {advancedLimits && (
               <button
                 type="button"
                 disabled={challengeBusy}
@@ -533,6 +701,7 @@ export default function SettingsModal() {
               >
                 Enregistrer les limites
               </button>
+              )}
               <button
                 type="button"
                 disabled={challengeBusy}
@@ -791,9 +960,9 @@ export default function SettingsModal() {
               Trading & discipline
             </legend>
             <p className="text-[10px] leading-relaxed text-slate-500">
-              Le risque % alimente le calculateur de lot PropGuard. Paper = entraînement ; Auto-Pilot
-              ne doit rester activé que si vous acceptez des ordres préparés automatiquement (score ≥
-              80 %).
+              Le risque % alimente le calculateur de lot PropGuard. Le mode WGF strict / conservateur
+              règle news, session NAS100 et spread. Auto-Pilot ne doit rester activé que si vous
+              acceptez des ordres préparés automatiquement (score ≥ 80 %).
             </p>
           <label className="block text-xs text-slate-400">
             Risque par trade (%)
@@ -814,7 +983,7 @@ export default function SettingsModal() {
               onChange={(e) => setPaperTrading(e.target.checked)}
               className="rounded border-slate-600 bg-slate-950"
             />
-            Mode paper — autoriser trades hors session US et spread simulé élevé
+            Mode paper — compte simulé local (reprise challenge en pause sans Kill Switch)
           </label>
           <label className="flex items-center gap-2 text-xs text-slate-300">
             <input

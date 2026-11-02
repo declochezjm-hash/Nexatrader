@@ -156,10 +156,29 @@ function runOptionalMigrations(database) {
     { name: 'google_account_email', ddl: 'TEXT' },
     { name: 'google_oauth_client_id', ddl: 'TEXT' },
     { name: 'paper_trading', ddl: 'INTEGER NOT NULL DEFAULT 1' },
+    { name: 'wgf_enforcement_mode', ddl: 'TEXT' },
     { name: 'market_provider', ddl: "TEXT NOT NULL DEFAULT 'simulated'" },
     { name: 'market_api_key', ddl: 'TEXT' },
+    { name: 'guardian_mode', ddl: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'local_social_enabled', ddl: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'wgf_purchased_wizard_done', ddl: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'local_social_best_profit', ddl: 'REAL NOT NULL DEFAULT 0' },
   ];
-  const challengeColumns = [{ name: 'anti_tilt_until', ddl: 'TEXT' }];
+  const challengeColumns = [
+    { name: 'anti_tilt_until', ddl: 'TEXT' },
+    {
+      name: 'wgf_program_id',
+      ddl: "TEXT NOT NULL DEFAULT 'wgf_2step_phase1'",
+    },
+    { name: 'wgf_phase', ddl: 'INTEGER NOT NULL DEFAULT 1' },
+    { name: 'last_daily_reset_gmt', ddl: 'TEXT' },
+    { name: 'eod_trailing_floor', ddl: 'REAL' },
+    { name: 'last_eod_process_gmt', ddl: 'TEXT' },
+    { name: 'last_equity_snapshot', ddl: 'REAL' },
+    { name: 'pass_reason', ddl: 'TEXT' },
+    { name: 'one_day_pass', ddl: 'INTEGER NOT NULL DEFAULT 0' },
+  ];
+  const tradeColumns = [{ name: 'plan_snapshot', ddl: 'TEXT' }];
   for (const col of columns) {
     const exists = database
       .prepare(`SELECT 1 FROM pragma_table_info('app_settings') WHERE name = ?`)
@@ -176,6 +195,29 @@ function runOptionalMigrations(database) {
       database.exec(`ALTER TABLE local_challenge ADD COLUMN ${col.name} ${col.ddl}`);
     }
   }
+  for (const col of tradeColumns) {
+    const exists = database
+      .prepare(`SELECT 1 FROM pragma_table_info('trades') WHERE name = ?`)
+      .get(col.name);
+    if (!exists) {
+      database.exec(`ALTER TABLE trades ADD COLUMN ${col.name} ${col.ddl}`);
+    }
+  }
+
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS wgf_audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      challenge_id INTEGER,
+      event_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      detail TEXT,
+      equity REAL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  database.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wgf_audit_challenge ON wgf_audit_log(challenge_id, id DESC)`,
+  );
 }
 
 export function ensureDatabaseSchema() {
